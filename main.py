@@ -4,8 +4,8 @@ from parser import *
 
 SHADERS_PACK_FOLDER = "./Shaders/"
 SOURCES_TO_PARSE = [
-    "**/composite*",
-    "**/final.fsh",
+    "**/composite*.glsl",
+    "**/final.glsl",
     "**/lib/*",
 ]
 SHADERPACKS: dict[str, list[list[str]]] = {}
