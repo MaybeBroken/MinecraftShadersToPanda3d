@@ -113,14 +113,22 @@ SHADER_PATH = Path("Shaders/")
 def modify_shader_sources(vertex_src: str, fragment_src: str) -> tuple[str, str]:
     # Ensure version directive is present and at the top; avoid duplicating if already set.
     version_line = "#version 330 core"
+    defaults = """
+#ifndef MC_VERSION
+#define MC_VERSION 12000
+#endif
+"""
 
-    def _normalize(src: str) -> str:
+    def _normalize(src: str, stage_define: str) -> str:
         stripped = src.lstrip()
+        injected = defaults + stage_define
         if stripped.startswith("#version"):
-            return stripped
-        return f"{version_line}\n" + stripped
+            return stripped + "\n" + injected
+        return f"{version_line}\n" + injected + stripped
 
-    return _normalize(vertex_src), _normalize(fragment_src)
+    vertex_norm = _normalize(vertex_src, "#define VSH\n")
+    fragment_norm = _normalize(fragment_src, "#define FSH\n")
+    return vertex_norm, fragment_norm
 
 
 def _resolve_includes(
@@ -141,6 +149,12 @@ def _resolve_includes(
             if include_target.is_absolute():
                 include_target = include_target.relative_to("/")
             include_path = pack_root / include_target
+            if not include_path.exists():
+                matches = list(pack_root.rglob(include_target.name))
+                if matches:
+                    include_path = matches[0]
+                else:
+                    raise RuntimeError(f"Include file not found: {include_target}")
             if include_path in seen:
                 raise RuntimeError(f"Include cycle detected at {include_path}")
             if not include_path.exists():
@@ -148,9 +162,27 @@ def _resolve_includes(
             seen.add(include_path)
             included = include_path.read_text()
             lines.append(_resolve_includes(included, pack_root, seen, depth + 1))
+            seen.remove(include_path)
             continue
         lines.append(line)
     return "\n".join(lines)
+
+
+# Utility to freeze program and view shader sources as text files
+def sView(vertex_src: str, fragment_src: str) -> None:
+    import tempfile
+    import webbrowser
+    import os
+
+    with tempfile.TemporaryDirectory() as tmpdirname:
+        vert_path = os.path.join(tmpdirname, "vertex_shader.glsl")
+        frag_path = os.path.join(tmpdirname, "fragment_shader.glsl")
+        with open(vert_path, "w") as vert_file:
+            vert_file.write(vertex_src)
+        with open(frag_path, "w") as frag_file:
+            frag_file.write(fragment_src)
+        webbrowser.open(f"file://{vert_path}")
+        webbrowser.open(f"file://{frag_path}")
 
 
 @dataclass
@@ -580,18 +612,20 @@ class GLCanvas(QOpenGLWidget):
             vertex_source, fragment_source
         )
 
+        sView(vertex_source, fragment_source)
+
         shader_pass.program = self._create_program(vertex_source, fragment_source)
 
     def _create_program(self, vertex_src: str, fragment_src: str) -> int:
         vert = glCreateShader(GL_VERTEX_SHADER)
         glShaderSource(vert, vertex_src)
         glCompileShader(vert)
-        self._check_compile(vert, "vertex")
+        self._check_compile(vert, "vertex", vertex_src)
 
         frag = glCreateShader(GL_FRAGMENT_SHADER)
         glShaderSource(frag, fragment_src)
         glCompileShader(frag)
-        self._check_compile(frag, "fragment")
+        self._check_compile(frag, "fragment", fragment_src)
 
         program = glCreateProgram()
         glAttachShader(program, vert)
@@ -603,11 +637,30 @@ class GLCanvas(QOpenGLWidget):
         glDeleteShader(frag)
         return program
 
-    def _check_compile(self, shader: int, stage: str) -> None:
+    def _format_shader_snippet(self, source: str, line_no: int, radius: int = 4) -> str:
+        lines = source.splitlines()
+        start = max(0, line_no - radius - 1)
+        end = min(len(lines), line_no + radius)
+        snippet = []
+        for idx in range(start, end):
+            prefix = "->" if idx + 1 == line_no else "  "
+            snippet.append(f"{prefix} {idx + 1:04d}: {lines[idx]}")
+        return "\n".join(snippet)
+
+    def _check_compile(self, shader: int, stage: str, source: str) -> None:
         status = glGetShaderiv(shader, GL_COMPILE_STATUS)
         if status != GL_TRUE:
             log = glGetShaderInfoLog(shader).decode()
-            raise RuntimeError(f"{stage} shader error: {log}")
+            line_no = None
+            for token in log.split():
+                if token.startswith("0:"):
+                    try:
+                        line_no = int(token.split(":")[1])
+                        break
+                    except ValueError:
+                        line_no = None
+            snippet = self._format_shader_snippet(source, line_no, 4) if line_no else ""
+            raise RuntimeError(f"{stage} shader error: {log}\n{snippet}")
 
     def _check_link(self, program: int) -> None:
         status = glGetProgramiv(program, GL_LINK_STATUS)
