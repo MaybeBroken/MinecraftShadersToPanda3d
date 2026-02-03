@@ -118,10 +118,24 @@ def modify_shader_sources(vertex_src: str, fragment_src: str) -> tuple[str, str]
 #define MC_VERSION 12000
 #endif
 """
+    compat = """
+#ifdef VSH
+#define varying out
+#define attribute in
+#else
+#define varying in
+#define attribute in
+#ifndef FRAG_COLOR_DEFINED
+#define FRAG_COLOR_DEFINED
+out vec4 FragColor;
+#define gl_FragColor FragColor
+#endif
+#endif
+"""
 
     def _normalize(src: str, stage_define: str) -> str:
         stripped = src.lstrip()
-        injected = defaults + stage_define
+        injected = defaults + stage_define + compat
         if stripped.startswith("#version"):
             return stripped + "\n" + injected
         return f"{version_line}\n" + injected + stripped
