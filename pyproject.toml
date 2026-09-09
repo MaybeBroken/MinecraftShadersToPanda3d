@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "MinecraftShaderDecompiler"
+version = "0.2.0"
+description = "Run a Minecraft (OptiFine/Iris) shaderpack's deferred pipeline inside an OpenGL engine (Panda3D), with an Iris-style options system and render-type object tagging."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { text = "MIT" }
+authors = [{ name = "MaybeBroken" }]
+keywords = ["minecraft", "shaders", "glsl", "panda3d", "opengl", "harfang", "gamedev"]
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Topic :: Multimedia :: Graphics :: 3D Rendering",
+    "License :: OSI Approved :: MIT License",
+]
+dependencies = []
+
+[project.optional-dependencies]
+panda3d = ["panda3d>=1.10"]
+generic = ["PyOpenGL>=3.1"]
+dev = ["pytest>=7"]
+
+[project.scripts]
+mcshader = "mcshader.__main__:main"
+
+[project.urls]
+Homepage = "https://github.com/MaybeBroken/MinecraftShaderDecompiler"
+
+[tool.setuptools]
+packages = [
+    "mcshader",
+    "mcshader.glsl",
+    "mcshader.pack",
+    "mcshader.config",
+    "mcshader.pipeline",
+    "mcshader.effects",
+    "mcshader.engine",
+]
+
+[tool.setuptools.package-data]
+"mcshader.effects" = ["sources/*.vert", "sources/*.frag"]

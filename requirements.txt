@@ -1,3 +1,4 @@
-PyOpenGL==3.1.6
-glfw==2.7.0
-numpy==1.26.4
+# Core library has no hard dependencies. Install what your backend needs:
+#   pip install panda3d      # for mcshader.engine.Panda3DAdapter
+#   pip install PyOpenGL     # for mcshader.engine.GenericGLAdapter
+# Or via extras:  pip install -e ".[panda3d]"   /   pip install -e ".[dev]"
