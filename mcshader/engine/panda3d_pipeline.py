@@ -140,6 +140,47 @@ class PipelineRenderer:
         nodepath.clear_shader()
         self._geometry = [(np, rt) for np, rt in self._geometry if np != nodepath]
 
+    def build_sky(self, radius: float = 900.0) -> Any:
+        """Attach a working procedural sky — gradient, sun, moon, stars, aurora.
+
+        BSL's ``gbuffers_skybasic`` computes all of that entirely from the
+        screen-space ray direction it reconstructs per pixel (see
+        ``GetSkyColor``/``ShaderSunMoon``/``DrawStars`` in
+        ``lib/atmospherics/sky.glsl`` and friends) — the geometry's only job
+        is to cover the sky so the fragment shader runs there. So this is
+        just a big sphere, tagged with the "sky_basic" render type, kept
+        centred on the camera every frame (see ``_update``) like a
+        conventional skybox: background bin, no depth test/write, so it
+        never has to be precisely sized relative to real geometry.
+
+        Sized to 90% of the camera's own far clip distance by default so it
+        works without the caller having to coordinate lens settings; pass a
+        smaller ``radius`` if you want the horizon closer.
+        """
+        far = self.base.camLens.get_far() if self.base.camLens else radius
+        radius = min(radius, far * 0.9)
+
+        sky = self.base.loader.load_model("models/misc/sphere")
+        sky.reparent_to(self.base.render)
+        sky.set_scale(radius)
+        sky.set_bin("background", 0)
+        sky.set_depth_test(False)
+        sky.set_depth_write(False)
+        sky.set_two_sided(True)  # the camera sits inside the sphere
+        sky.set_light_off(1)
+        # gbuffers_skybasic.glsl hides vanilla's own sunset-gradient quad by
+        # checking for a *grayscale* vertex colour (`gl_Color.r==g==b`, the
+        # branch taken here since we don't feed an MC_VERSION >= 1.16.5
+        # renderStage) — sphere.egg's default white vertex colour would trip
+        # that and force alpha to 0, making the whole dome invisible. Any
+        # non-grayscale colour sidesteps it; the shader ignores vertex
+        # colour entirely otherwise; it's computing everything itself.
+        sky.set_color(1, 0, 0, 1)
+
+        self.set_render_type(sky, "sky_basic")
+        self._sky_np = sky
+        return sky
+
     # -- build / teardown -----------------------------------------------
     def _build(self) -> None:
         self._uniform_types: dict[str, str] = {}   # non-sampler uniforms -> glsl type
@@ -286,20 +327,36 @@ class PipelineRenderer:
             # Ping-pong twin for composite read-after-write.
             self._colortex_back[index] = self._alloc_colortex(index, fmt)
 
-    def _make_buffer(self, name: str, n_color: int, want_depth: bool,
+    def _make_buffer(self, name: str, colortex_indices: list[int | None], want_depth: bool,
                      sort: int = -10) -> Any:
-        """Create an offscreen MRT buffer with ``n_color`` color attachments.
-
-        ``sort`` orders passes: more-negative renders earlier, so the gbuffer
-        renders before composites, which render before the window.
+        """Create an offscreen MRT buffer with one attachment per entry of
+        ``colortex_indices`` (primary color, then aux 0..3) — ``None`` for a
+        slot with no meaningful colortex (cleared normally, nothing else
+        cares). ``sort`` orders passes: more-negative renders earlier, so the
+        gbuffer renders before composites, which render before the window.
         """
         from panda3d.core import (FrameBufferProperties, GraphicsPipe,
                                    GraphicsOutput, WindowProperties)
 
+        n_color = len(colortex_indices)
         fb = FrameBufferProperties()
         fb.set_rgba_bits(16, 16, 16, 16)
         fb.set_float_color(True)
-        fb.set_aux_rgba(max(0, n_color - 1))
+        # set_aux_rgba() requests plain 8-bit-per-channel AUX attachments, but
+        # every colortex we allocate (_alloc_colortex) is a T_float texture —
+        # RGBA16/RGB16F/etc, whatever the pack's colortexNFormat says.
+        # set_aux_hrgba() requests half-float (16-bit-per-channel) AUX
+        # attachments, matching what we actually allocate. This must stay in
+        # lockstep with the RTP_aux_hrgba_* plane enum used below and in
+        # _bind_scene_attachments/_render_quad — Panda has THREE distinct aux
+        # attachment families (RTP_aux_rgba_N / RTP_aux_hrgba_N /
+        # RTP_aux_float_N), one per precision, and a buffer only actually
+        # has the planes matching whichever set_aux_* it was asked for.
+        # Requesting hrgba here while the slot arrays elsewhere still used
+        # RTP_aux_rgba_N pointed every "aux" attachment at a plane the
+        # buffer never allocated — that produced a total white-screen
+        # failure, not a partial one, which is exactly what surfaced this.
+        fb.set_aux_hrgba(max(0, n_color - 1))
         if want_depth:
             fb.set_depth_bits(24)
         win = self.base.win
@@ -307,6 +364,42 @@ class PipelineRenderer:
             win.get_pipe(), name, sort, fb, WindowProperties.size(
                 win.get_x_size(), win.get_y_size()),
             GraphicsPipe.BF_refuse_window, win.get_gsg(), win)
+        # Every attachment (primary + aux) starts as driver-allocated VRAM,
+        # not zeroed — unlike the fixed-point 8-bit format this used to
+        # request, a genuine float attachment can hold NaN/Inf bit patterns,
+        # and a single NaN sampled anywhere in a lighting calculation
+        # poisons the whole expression (propagates through every add/mul
+        # touching it). Force an explicit, real clear on every buffer we
+        # create so a pass's first read of a not-yet-written aux target
+        # sees defined zeros, not whatever was previously in that memory —
+        # EXCEPT for a colortex the pack declares ``colortexNClear = false``
+        # (BSL's colortex2/5/9): those are genuine cross-frame history
+        # (TAA color, auto-exposure, lens-flare visibility, DOF focus — see
+        # composite5/7.glsl), and clearing them every frame was the actual
+        # cause of "colortex2 always reads back zero" — a GL clear on a
+        # buffer runs unconditionally before that buffer's own pass draws,
+        # regardless of what the pass's shader later overwrites, so it wiped
+        # frame N's history before frame N+1's earliest reader ever saw it.
+        # Leaving the plane uncleared is sufficient (no extra double-buffer
+        # bookkeeping needed): each `colortex_indices` entry is the same
+        # persistent Texture object every frame (never reallocated outside a
+        # rebuild — see _alloc_buffers), and _render_quad's existing
+        # self-read ping-pong (for a pass that both samples and writes the
+        # same colortex) already gives BSL's real multi-pass history chains
+        # (composite5 writes, composite7 reads-and-rewrites) a stable
+        # 2-texture cycle that keeps working frame over frame for exactly
+        # the same reason a single physical texture does.
+        buf.set_clear_color_active(True)
+        buf.set_clear_color((0, 0, 0, 0))
+        plane_ids = [GraphicsOutput.RTP_color] + [
+            getattr(GraphicsOutput, f"RTP_aux_hrgba_{i}") for i in range(4)
+        ]
+        for slot, plane in enumerate(plane_ids[:max(1, n_color)]):
+            idx = colortex_indices[slot] if slot < len(colortex_indices) else None
+            should_clear = idx is None or self.graph.buffers.clear.get(idx, True)
+            buf.set_clear_active(plane, should_clear)
+            if should_clear:
+                buf.set_clear_value(plane, (0, 0, 0, 0))
         self._buffers.append(buf)
         return buf
 
@@ -315,7 +408,7 @@ class PipelineRenderer:
         from panda3d.core import GraphicsOutput
 
         slots = [GraphicsOutput.RTP_color] + [
-            getattr(GraphicsOutput, f"RTP_aux_rgba_{i}") for i in range(4)
+            getattr(GraphicsOutput, f"RTP_aux_hrgba_{i}") for i in range(4)
         ]
         for colortex, slot in sorted(self._gbuffer_map.items(), key=lambda kv: kv[1]):
             if slot < len(slots) and colortex in self._colortex:
@@ -324,34 +417,95 @@ class PipelineRenderer:
 
     def _build_scene_target(self) -> None:
         """Point the main camera at the gbuffer MRT instead of the window."""
+        slot_of = {slot: colortex for colortex, slot in self._gbuffer_map.items()}
         n_targets = max(1, len(self._gbuffer_map))
+        gbuffer_indices = [slot_of.get(i) for i in range(n_targets)]
         # Render the gbuffer before every composite pass.
         self._scene_buf = self._make_buffer(
-            "mcshader-gbuffer", n_targets, want_depth=True, sort=-100)
+            "mcshader-gbuffer", gbuffer_indices, want_depth=True, sort=-100)
         self._scene_buf.set_clear_color((0, 0, 0, 1))
         self._bind_scene_attachments(self._scene_buf)
         dr = self._scene_buf.make_display_region()
         dr.set_camera(self.base.cam)
 
     def _sun_direction(self, time_angle: float = 0.25) -> Any:
-        """World-space direction from the scene toward the sun, at a given
-        ``timeAngle`` (0..1, the fraction of a day — see `_day_cycle_uniforms`).
+        """Direction from the scene toward the sun, at a given ``timeAngle``
+        (0..1, the fraction of a day — see `_day_cycle_uniforms`), in
+        **Minecraft's own Y-up world convention** (Y = the vertical arc).
 
         Shares the shape of BSL's own in-shader sun-arc remap (see
-        ``lib/atmospherics/sunmoon.glsl``'s ``ang`` calculation) so the sun
-        rises/sets at roughly the same pace the shaders animate it at,
-        without needing this engine's Z-up world reconciled with Minecraft's
-        Y-up convention (out of scope here — this only drives *this* Python
-        side's shadow-camera placement, not the shaders' own sun/sky math).
+        ``lib/atmospherics/sunmoon.glsl``'s ``ang`` calculation, and
+        ``gbuffers_terrain.glsl``'s vertex-shader ``sunVec`` construction,
+        which likewise puts the rise/set arc in the Y component) so the sun
+        rises/sets at roughly the same pace the shaders animate it at.
+
+        Every caller needing this in *this engine's* native Z-up scene graph
+        (to position a real Panda camera/light node) must convert it first
+        via :meth:`_cs_conversion` — see the matching comment in
+        `_build_shadow_pass`/`_dynamic_uniforms` for why: Minecraft shaders
+        (BSL confirmed directly — ``gbufferModelView[1]`` is read as the
+        view-space up vector, ``GetCloudShadow``'s ``worldLightVec.y`` as the
+        vertical component) assume world-space Y is up throughout, which this
+        engine's native Panda convention (Y-forward, Z-up) is not.
         """
         import math
         from panda3d.core import LVecBase3
 
         ang = (time_angle + 0.0001 - 0.25) % 1.0
         ang = (ang + (math.cos(ang * math.pi) * -0.5 + 0.5 - ang) / 3.0) * 2.0 * math.pi
-        d = LVecBase3(0.3, -math.sin(ang), math.cos(ang))
+        d = LVecBase3(-math.sin(ang), math.cos(ang), 0.3)
         d.normalize()
         return d
+
+    @staticmethod
+    def _cs_conversion() -> tuple[Any, Any]:
+        """Rotation-only matrices reconciling this engine's native Z-up,
+        Y-forward world with the Y-up world every Minecraft shader assumes.
+
+        This is the crux of a bug confirmed directly in BSL's own source:
+        ``gbuffers_terrain.glsl``'s vertex shader reads ``gbufferModelView[1]``
+        (the matrix's Y column) straight out as the view-space "up" vector,
+        and ``lib/lighting/shadows.glsl``'s ``GetCloudShadow`` reads a
+        reconstructed world vector's ``.y`` component as its vertical
+        (height) component — both assume world-space Y *is* up, matching
+        Minecraft's own convention. Feeding these uniforms unconverted Panda
+        matrices (Y-forward, Z-up) silently swaps "up" onto a horizontal
+        axis instead: the sky's vertical falloff runs along the wrong axis,
+        shadows / sun direction come out rotated relative to the real scene,
+        and every per-object effect keyed off world Y (waving amplitude,
+        world curvature) is broken.
+
+        Panda's own scene graph, and every transform that actually drives
+        real rendering (the automatic ``p3d_ModelViewMatrix``/lens
+        projection Panda supplies, untouched here), stay native Z-up
+        throughout — this conversion only touches the shader-facing
+        ``gbuffer*``/``shadow*`` uniforms computed in `_dynamic_uniforms`.
+        Built from Panda's own well-tested coordinate-system utility
+        (``LMatrix4.convert_mat``), not hand-derived, and applied as a pure
+        rotation (no translation) — see `_rotation_only`.
+        """
+        from panda3d.core import LMatrix4, CS_zup_right, CS_yup_right
+
+        return (LMatrix4.convert_mat(CS_zup_right, CS_yup_right),
+                LMatrix4.convert_mat(CS_yup_right, CS_zup_right))
+
+    @staticmethod
+    def _rotation_only(mat: Any) -> Any:
+        """The pure-rotation part of an affine ``LMatrix4`` (row-vector
+        convention: ``v * M``, translation lives in row 3) — zeroes the
+        translation, keeping just the 3x3 linear part.
+
+        Minecraft's own ``gbufferModelView`` carries no translation (its
+        vertex data is already camera-relative before any matrix applies);
+        replicating that here, from Panda's real (translation-including)
+        camera transform, is what keeps the shader-facing view matrices
+        semantically correct — see `_cs_conversion`.
+        """
+        from panda3d.core import LMatrix4, LVecBase4
+
+        m = LMatrix4(mat)
+        m.set_row(3, LVecBase4(0, 0, 0, 1))
+        return m
 
     def _build_shadow_pass(self) -> None:
         from panda3d.core import (Camera, OrthographicLens, NodePath, GraphicsOutput,
@@ -370,6 +524,13 @@ class PipelineRenderer:
         from panda3d.core import Texture
         fb = FrameBufferProperties()
         fb.set_depth_bits(24)
+        # shadowcolor0 (colored/translucent shadow casting — stained glass,
+        # leaves, BSL's SHADOW_COLOR and WATER_CAUSTICS features) needs a real
+        # RGBA color attachment: shadow.glsl's fragment stage always writes
+        # gl_FragData[0] = albedo, but a depth-only FBO has nowhere for that
+        # write to land, so it was silently discarded and every shadow was
+        # opaque/uncolored regardless of what SHADOW_COLOR requested.
+        fb.set_rgba_bits(8, 8, 8, 8)
         win = self.base.win
         self._shadow_buf = self.base.graphicsEngine.make_output(
             win.get_pipe(), "mcshader-shadow", -200, fb,
@@ -383,6 +544,17 @@ class PipelineRenderer:
         self._shadow_tex.set_magfilter(Texture.FT_shadow)
         self._shadow_buf.add_render_texture(
             self._shadow_tex, GraphicsOutput.RTM_bind_or_copy, GraphicsOutput.RTP_depth)
+        self._shadow_color_tex = Texture("mcshader-shadow-color")
+        self._shadow_color_tex.set_wrap_u(Texture.WM_border_color)
+        self._shadow_color_tex.set_wrap_v(Texture.WM_border_color)
+        # Outside the shadow frustum, transmit full light with no tint — must
+        # NOT reuse shadowtex's (1,1,1,1) border verbatim by accident sharing
+        # state; this is its own Texture with its own border, set explicitly.
+        self._shadow_color_tex.set_border_color((1, 1, 1, 1))
+        self._shadow_color_tex.set_minfilter(Texture.FT_linear)
+        self._shadow_color_tex.set_magfilter(Texture.FT_linear)
+        self._shadow_buf.add_render_texture(
+            self._shadow_color_tex, GraphicsOutput.RTM_bind_or_copy, GraphicsOutput.RTP_color)
         self._buffers.append(self._shadow_buf)
         dist = float(self.options.get("shadowDistance")) if "shadowDistance" in self.options.options else 256.0
         self._shadow_dist = dist
@@ -396,11 +568,30 @@ class PipelineRenderer:
             cam.set_initial_state(
                 RenderState.make(ShaderAttrib.make(shadow_shader)))
         self._shadow_cam = self.base.render.attach_new_node(cam)
-        # Point the shadow camera down the sun direction at the scene origin so
-        # its depth map — and the shadowModelView/Projection uniforms derived
-        # from it — actually match the lighting direction shaders are fed.
-        self._shadow_cam.set_pos(self._sun_direction() * (dist * 0.5))
-        self._shadow_cam.look_at(0, 0, 0)
+        # Point the shadow camera down the sun direction, centred on the
+        # PLAYER (base.cam), not the world origin. Minecraft's own shadow
+        # frustum is always player-relative — the world has no meaningful
+        # origin to center on — and shadow.vsh's distortion formula (see
+        # Shaders/shaders/program/shadow.glsl) concentrates virtually all of
+        # the shadow map's resolution within a small disc around distortion
+        # "dist=0", i.e. around wherever this frustum is centered. Centering
+        # on a fixed (0,0,0) instead of the camera meant shadows only ever
+        # looked right for geometry sitting near the world origin, and get
+        # more visibly wrong the further the camera roams — and *more* wrong
+        # at higher shadowDistance profiles (HIGH/ULTRA), since a bigger
+        # shadowDistance shrinks the well-resolved disc's share of the frustum
+        # even further relative to the (still misplaced) visible scene. See
+        # the matching per-frame update in `_dynamic_uniforms`.
+        from panda3d.core import LPoint3
+        center = (self.base.cam.get_pos(self.base.render) if self.base.cam
+                  else LPoint3(0, 0, 0))
+        # _sun_direction() is in Minecraft's Y-up convention (see its
+        # docstring); this engine's actual scene-graph node needs it back in
+        # native Z-up to be positioned correctly — see `_cs_conversion`.
+        _, cs_yup_to_zup = self._cs_conversion()
+        sun_panda = cs_yup_to_zup.xform_vec(self._sun_direction())
+        self._shadow_cam.set_pos(center + sun_panda * (dist * 0.5))
+        self._shadow_cam.look_at(center)
         dr = self._shadow_buf.make_display_region()
         dr.set_camera(self._shadow_cam)
 
@@ -417,6 +608,27 @@ class PipelineRenderer:
         feedback loop (undefined in GL) — it's what produced speckled noise
         in place of the refined image. These indices must render into the
         ping-pong back buffer instead; see :meth:`_render_quad`.
+
+        Applies uniformly, including to buffers the pack marks
+        ``colortexNClear = false`` (BSL's colortex2/5/9 — real cross-frame
+        history: auto-exposure, TAA color, lens-flare visibility, DOF focus).
+        Exempting those from the swap was tried once and made things worse —
+        two different passes (composite5 and composite7, both writing
+        colortex2) then both targeted the exact same Texture as their own
+        buffer's render attachment, which Panda doesn't support (the write
+        went nowhere). The swap must stay; what those buffers actually needed
+        was for `_make_buffer` to stop *clearing* the plane each frame (a GL
+        clear runs unconditionally before that buffer's own pass draws,
+        which was wiping frame N's history before frame N+1's earliest
+        reader ever saw it — the real cause of "colortex2 always reads back
+        zero", not this ping-pong). With clearing fixed, this build-time
+        swap is *sufficient* for correct frame-to-frame persistence on its
+        own: composite5's/composite7's fixed sampler and render-target
+        bindings (established once here, at build time, from whichever two
+        physical Textures the swap leaves them pointing at) never change
+        again, so every subsequent frame composite5 reads whatever
+        composite7 wrote last frame and vice versa — a stable, self-sustaining
+        2-texture cycle, no per-frame bookkeeping needed.
         """
         if tp is None or not tp.fragment:
             return set()
@@ -475,10 +687,10 @@ class PipelineRenderer:
         # the first, or every buffer past the first silently never gets written.
         targets = p.outputs or [0]
         n_color = max(1, min(len(targets), self._maxattach))
-        buf = self._make_buffer(f"mcshader-{p.name}", n_color=n_color, want_depth=False,
+        buf = self._make_buffer(f"mcshader-{p.name}", targets[:n_color], want_depth=False,
                                 sort=-50 + order)
         slots = [GraphicsOutput.RTP_color] + [
-            getattr(GraphicsOutput, f"RTP_aux_rgba_{i}") for i in range(4)
+            getattr(GraphicsOutput, f"RTP_aux_hrgba_{i}") for i in range(4)
         ]
         for slot, colortex in enumerate(targets[:n_color]):
             # A pass that samples the same colortex it writes (BSL's colortex1
@@ -562,9 +774,30 @@ class PipelineRenderer:
                    "gaux1": 4, "gaux2": 5, "gaux3": 6, "gaux4": 7}
         for alias, idx in aliases.items():
             bind(alias, self._colortex.get(idx, self._fallback_tex()))
-        shadow = getattr(self, "_shadow_tex", None) or self._fallback_tex()
-        for s in ("shadowtex0", "shadowtex1", "shadowcolor0", "shadowcolor1"):
-            bind(s, shadow)
+        shadow_depth = getattr(self, "_shadow_tex", None) or self._fallback_tex()
+        for s in ("shadowtex0", "shadowtex1"):
+            bind(s, shadow_depth)
+        # shadowcolor0/1 are plain (non depth-compare) sampler2D uniforms that
+        # hold the shadow pass's rendered albedo (colored/translucent shadow
+        # casting). Binding them to the SAME Texture object as shadowtex0/1
+        # is wrong twice over: semantically they're a different image, and
+        # that texture's sampler state is configured for hardware depth
+        # comparison (FT_shadow) — sampling it as a plain color would read
+        # back a 0/1 comparison result, not albedo, wherever the GSG doesn't
+        # give the two bindings independent sampler state.
+        shadow_color = getattr(self, "_shadow_color_tex", None)
+        opaque_white = getattr(self, "_opaque_white_tex", None)
+        if opaque_white is None:
+            from panda3d.core import Texture as _Texture
+            opaque_white = _Texture("mcshader-opaque-white")
+            opaque_white.setup_2d_texture(1, 1, _Texture.T_unsigned_byte, _Texture.F_rgba)
+            opaque_white.set_ram_image(bytes([255, 255, 255, 255]))
+            self._opaque_white_tex = opaque_white
+        bind("shadowcolor0", shadow_color if shadow_color is not None else opaque_white)
+        # shadow.glsl only ever writes gl_FragData[0]; shadowcolor1 has no
+        # producer in this pack, so it gets the semantically-neutral
+        # "fully lit, no tint" default rather than aliasing shadowcolor0.
+        bind("shadowcolor1", opaque_white)
         for s in ("depthtex0", "depthtex1", "depthtex2"):
             bind(s, self._colortex.get(0, self._fallback_tex()))
         bind("noisetex", self._fallback_tex())
@@ -644,41 +877,87 @@ class PipelineRenderer:
         # fixed at the origin no matter where the camera actually was.
         render, cam_np, lens = self.base.render, self.base.cam, self.base.camLens
         w = float(self.base.win.get_x_size()); h = float(self.base.win.get_y_size())
-        mv = render.get_mat(cam_np)              # world -> view
-        mv_inv = cam_np.get_mat(render)          # view -> world
-        proj = LMatrix4(lens.get_projection_mat())
-        proj_inv = LMatrix4(proj); proj_inv.invert_in_place()
         cam_pos = cam_np.get_pos(render)
         frame_count = int(clock.get_frame_count())
         day = self._day_cycle_uniforms(t, frame_count)
-        sun_world = self._sun_direction(day["timeAngle"])
-        sun_view = mv.xform_vec(sun_world) * 100.0
-        up_view = mv.xform_vec(LVecBase3(0, 0, 1)) * 100.0
+
+        cs_zup_to_yup, cs_yup_to_zup = self._cs_conversion()
+
+        # gbufferModelView/Inverse: Minecraft-Y-up-world(relative to the
+        # PLAYER camera) <-> the real, native Panda camera-local space —
+        # see `_cs_conversion`/`_rotation_only` for why this is a pure
+        # rotation (no translation: BSL's own gbufferModelView carries none
+        # either, since Minecraft's vertex data is already camera-relative).
+        # Built as a true inverse pair (gbuffer_mv is the *numeric* inverse
+        # of gbuffer_mv_inv) so every self-cancelling
+        # `gbufferModelView * gbufferModelViewInverse * ...` chain BSL's own
+        # vertex shaders use (see gbuffers_terrain.glsl) reduces to Panda's
+        # own real per-object transform, regardless of this matrix's
+        # semantics — real rendered geometry position is provably unaffected
+        # by this reconciliation, only the shaders' own world-space math is.
+        rot_player = self._rotation_only(cam_np.get_mat(render))  # player-view -> world
+        gbuffer_mv_inv = rot_player * cs_zup_to_yup
+        gbuffer_mv = LMatrix4(gbuffer_mv_inv)
+        gbuffer_mv.invert_in_place()
+
+        proj = LMatrix4(lens.get_projection_mat())
+        proj_inv = LMatrix4(proj); proj_inv.invert_in_place()
+
+        camera_position_mc = cs_zup_to_yup.xform_point(cam_pos)
+
+        sun_mc = self._sun_direction(day["timeAngle"])
+        sun_view = gbuffer_mv.xform_vec(sun_mc) * 100.0
+        up_view = gbuffer_mv.xform_vec(LVecBase3(0, 1, 0)) * 100.0
 
         shadow_cam_np = getattr(self, "_shadow_cam", None)
         if shadow_cam_np is not None:
-            # Track the moving sun so the shadow map (and the shadowModelView/
-            # Projection derived from it below) keeps matching the lighting
-            # direction the day cycle now animates, instead of staying fixed
-            # at wherever the sun was when the pipeline was first built.
+            # Track the moving sun AND the player each frame, so the shadow
+            # map (and the shadowModelView/Projection derived from it below)
+            # stays centred on the camera — see the matching comment in
+            # `_build_shadow_pass` for why a fixed world-origin center is
+            # wrong. Re-centering every frame is what makes shadows follow
+            # the player around an arbitrarily large world instead of only
+            # ever looking right near (0,0,0).
             dist = getattr(self, "_shadow_dist", 256.0)
-            shadow_cam_np.set_pos(sun_world * (dist * 0.5))
-            shadow_cam_np.look_at(0, 0, 0)
-            s_mv = render.get_mat(shadow_cam_np)
-            s_mv_inv = shadow_cam_np.get_mat(render)
+            sun_panda = cs_yup_to_zup.xform_vec(sun_mc)
+            shadow_cam_np.set_pos(cam_pos + sun_panda * (dist * 0.5))
+            shadow_cam_np.look_at(cam_pos)
+
             s_proj = LMatrix4(shadow_cam_np.node().get_lens().get_projection_mat())
             s_proj_inv = LMatrix4(s_proj); s_proj_inv.invert_in_place()
+
+            # Same rotation-only reconciliation as gbufferModelView, but the
+            # shadow camera sits at a different real position than the
+            # player — `position`/`worldPos` in every BSL program (shadow
+            # pass included: see shadow.glsl's `worldPos = position.xyz +
+            # cameraPosition.xyz`) is always relative to the PLAYER's
+            # cameraPosition, so this also carries the
+            # (shadow-cam -> player-cam) offset, re-expressed in Minecraft's
+            # Y-up axes, as a translation. Still a true inverse pair with
+            # s_mv (numeric inverse below), so — exactly as with
+            # gbufferModelView — the real rendered shadow-map geometry
+            # (shadow.glsl's own self-cancelling
+            # `shadowProjection*shadowModelView*shadowModelViewInverse*
+            # shadowProjectionInverse*ftransform()` chain) is provably
+            # unaffected by this reconciliation even if it were wrong; only
+            # the shadow pass's own world-space math (waving, water
+            # caustics) depends on getting the offset right.
+            rot_shadow = self._rotation_only(shadow_cam_np.get_mat(render))
+            offset = cs_zup_to_yup.xform_vec(shadow_cam_np.get_pos(render) - cam_pos)
+            s_mv_inv = rot_shadow * cs_zup_to_yup * LMatrix4.translate_mat(offset)
+            s_mv = LMatrix4(s_mv_inv)
+            s_mv.invert_in_place()
         else:
-            s_mv, s_mv_inv, s_proj, s_proj_inv = mv, mv_inv, proj, proj_inv
+            s_mv, s_mv_inv, s_proj, s_proj_inv = gbuffer_mv, gbuffer_mv_inv, proj, proj_inv
         return {
             "frameTimeCounter": t, "frameTime": clock.get_dt(),
             "frameCounter": frame_count,
             "viewWidth": w, "viewHeight": h, "aspectRatio": w / max(h, 1.0),
             "near": lens.get_near(), "far": lens.get_far(),
             **day, "rainStrength": 0.0, "wetness": 0.0,
-            "cameraPosition": cam_pos, "previousCameraPosition": cam_pos,
-            "gbufferModelView": mv, "gbufferModelViewInverse": mv_inv,
-            "gbufferPreviousModelView": mv,
+            "cameraPosition": camera_position_mc, "previousCameraPosition": camera_position_mc,
+            "gbufferModelView": gbuffer_mv, "gbufferModelViewInverse": gbuffer_mv_inv,
+            "gbufferPreviousModelView": gbuffer_mv,
             "gbufferProjection": proj, "gbufferProjectionInverse": proj_inv,
             "gbufferPreviousProjection": proj,
             "shadowModelView": s_mv, "shadowModelViewInverse": s_mv_inv,
@@ -714,6 +993,11 @@ class PipelineRenderer:
         from direct.task import Task
 
         dynamic = self._dynamic_uniforms()
+        sky_np = getattr(self, "_sky_np", None)
+        if sky_np is not None:
+            # A skybox must stay centred on the viewer, not the world origin,
+            # or the camera would eventually pass through its wall.
+            sky_np.set_pos(self.base.render, dynamic["cameraPosition"])
         for node in [self.base.render] + self._quads:
             for name, gtype in self._uniform_types.items():
                 value = dynamic.get(name)

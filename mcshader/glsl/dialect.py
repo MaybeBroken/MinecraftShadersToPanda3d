@@ -158,6 +158,44 @@ def translate_stage(
         introduced.append((texcoord_attr, "attrib vec2"))
     body = re.sub(r"\bgl_MultiTexCoord1\b", "vec4(1.0)", body)
 
+    # 3b. Custom Minecraft per-vertex attributes (mc_Entity, mc_midTexCoord, …)
+    # have no real per-vertex data in engine-authored geometry — nothing in this
+    # translator's output was ever wired to a vertex column named "mc_Entity",
+    # so declaring it as a bare `in vec4 mc_Entity;` (what the generic
+    # attribute->in qualifier swap above does on its own) leaves it reading
+    # whatever the driver defaults an unbound attribute to (typically all
+    # zeros). Since `mc_Entity.x` is the block id BSL's WavingBlocks() (and
+    # every material-branching gbuffers program) keys off of, this silently
+    # disabled per-object waving/movement/emissive-material selection
+    # entirely, no matter what an adapter's `set_block_id()` was told to do.
+    # Synthesize these as per-object globals driven by the `mcEntityId`
+    # uniform an adapter DOES feed per node (see PipelineRenderer.set_block_id)
+    # — a whole-object approximation of the real per-vertex value, correct for
+    # the common case (one block id per tagged object) and strictly better
+    # than the always-zero status quo for a mixed-id mesh.
+    extra_header: list[str] = []
+    if stage == "vertex":
+        entity_decl_re = re.compile(r"^[ \t]*(?:attribute|in)\s+vec4\s+mc_Entity\s*;\s*$", re.M)
+        if entity_decl_re.search(body):
+            body = entity_decl_re.sub("", body)
+            extra_header += [
+                "uniform float mcEntityId;",
+                "vec4 mc_Entity = vec4(mcEntityId, 0.0, 0.0, 1.0);",
+            ]
+        midtex_decl_re = re.compile(r"^[ \t]*(?:attribute|in)\s+vec4\s+mc_midTexCoord\s*;\s*$", re.M)
+        if midtex_decl_re.search(body):
+            body = midtex_decl_re.sub("", body)
+            # Equal to the live texcoord (not a real face midpoint), so any
+            # `texCoord.t < mc_midTexCoord.t` "top half only" split BSL makes
+            # (e.g. tall-grass-only-sways-at-the-top) resolves to "whole mesh
+            # sways" instead — an honest approximation, not a real midpoint.
+            # Force the texcoord attribute's own declaration to exist even if
+            # this particular source never separately referenced
+            # gl_MultiTexCoord0 itself (in practice it always does, but this
+            # keeps the synthesis self-contained rather than order-dependent).
+            introduced.append((texcoord_attr, "attrib vec2"))
+            extra_header.append(f"vec4 mc_midTexCoord = vec4({texcoord_attr}, 0.0, 1.0);")
+
     # 4. Texture function renames.
     body = _word_sub(body, _TEX_FUNCS)
 
@@ -219,6 +257,8 @@ def translate_stage(
         header += frag_outs
     if decls:
         header += ["// [mcshader] injected engine inputs"] + decls
+    if extra_header:
+        header += ["// [mcshader] synthesized per-object vertex-input approximations"] + extra_header
 
     result.source = "\n".join(header) + "\n\n" + body.strip() + "\n"
     return result

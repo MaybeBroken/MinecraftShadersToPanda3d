@@ -162,16 +162,76 @@ than all three above combined:
 With all five fixed, a render is now a genuinely coherent scene — correct
 perspective convergence at the horizon, a distinctly-colored water plane, a
 recognizable object silhouette — not an incremental improvement on the noise.
-BSL specifically still looks rough end-to-end under its default
-**HIGH**/**ULTRA** profiles, because BSL leans hard on features this runner
-doesn't have yet (this part *is* fidelity work, not more wiring bugs):
 
-- **No cross-frame history.** BSL's `composite5` explicitly treats colortex2 as
-  "temporal data" (reprojected screen-space reflections/volumetrics) — it
-  expects last *frame's* buffer, not just last *pass's*. The runner has no
-  concept of frame-to-frame buffer persistence yet, so these effects read
-  garbage. The **MINIMUM** profile avoids most of this and looks noticeably
-  cleaner — prefer it until history buffers land.
+A fourth pass found a deeper, more consequential bug than any of the above:
+**every Minecraft shader assumes world-space Y is up** (confirmed directly in
+BSL's own source — `gbuffers_terrain.glsl`'s vertex shader reads
+`gbufferModelView[1]` straight out as the view-space "up" vector, and
+`shadows.glsl`'s `GetCloudShadow` reads a reconstructed world vector's `.y` as
+its vertical component), but this engine's native world is Z-up/Y-forward, and
+the `gbufferModelView`/`shadowModelView`-family uniforms were being fed
+unconverted Panda matrices. The practical effect: "up" silently landed on a
+horizontal axis for every piece of shader math that used it directly — the
+sky's vertical falloff ran along the wrong axis (dark bands where there
+should be zenith/horizon gradient), the sun/shadow direction was rotated
+relative to the real scene (shadows not lining up with objects, appearing to
+swing as the camera turned), and every per-object effect keyed off world Y
+(foliage waving amplitude, world curvature) was broken. Fixed with a
+rotation-only Z-up↔Y-up reconciliation (`PipelineRenderer._cs_conversion`)
+applied to the shader-facing `gbufferModelView(Inverse)`/`shadowModelView
+(Inverse)`/`cameraPosition`/sun-direction uniforms — Panda's own scene graph
+and everything that drives *actual* rendered geometry position
+(`p3d_ModelViewMatrix`, the real camera/lens) stay native Z-up throughout and
+are provably unaffected (verified numerically: the self-cancelling identity
+every BSL vertex shader relies on, `gbufferModelView *
+gbufferModelViewInverse * gl_ModelViewMatrix * gl_Vertex`, reduces to exactly
+Panda's real per-object transform regardless of this matrix's contents — only
+the shaders' own world-space math depends on getting the convention right).
+Visually confirmed: the sky now renders a normal gradient at every profile
+(previously a solid/axis-inverted dark patch), and terrain/geometry show
+coherent directional lighting. **Not separately re-verified this pass:**
+whether a ground-contact shadow is now visibly cast under an object — see the
+existing shadow-bias caveat below, which predates (and is logically
+independent of) this fix.
+
+A fifth pass fixed cross-frame history — colortex2 (BSL's TAA color history,
+auto-exposure, lens-flare visibility, and DOF focus, all packed into one
+`colortexNClear = false` buffer) was reading back as exactly zero on every
+frame, which was the direct cause of the persistent speckled grain at
+**HIGH**/**ULTRA** (AO and TAA both lean on this history to denoise their
+per-frame-noisy samples) and silently disabled lens flare outright (its own
+gating check, `tempVisibleSun`, is read from a corner texel of this same
+buffer — permanently zero meant `if (lensFlareFactor > 0.0001)` never ran).
+Root cause: `_make_buffer` was unconditionally clearing every render target's
+color/aux planes at the start of each frame (added earlier as a real, correct
+fix for NaN/Inf propagating from uninitialized float VRAM) — for a genuine
+`Clear = false` buffer, that GL clear runs *before* that buffer's own pass
+draws, regardless of what the pass's shader later overwrites, so it wiped
+frame N's history before frame N+1's earliest reader (`composite5`) ever saw
+it. Fixed by making the clear decision per attachment slot
+(`self.graph.buffers.clear`), skipping it for `Clear = false` colortex
+indices. No other change was needed: `_render_quad`'s existing self-read
+ping-pong (for `composite5`/`composite7`, which both sample and write
+colortex2 in the same pass — a hazard the pack-wide `_self_read_outputs`
+already detects) already gives that a stable, self-sustaining 2-texture
+cycle across frames once the clear stopped wiping it — confirmed both by
+direct pixel inspection of the write pattern and, more convincingly, by
+rendering the same camera position for 3 vs. 120 frames at **ULTRA**: the
+speckle noise visibly converges/smooths out instead of staying constant.
+Also enables `SHADER_SUN_MOON` (BSL's real sun/moon disc, geometrically
+correct against the coordinate fix above — confirmed via screenshot) and
+`LENS_FLARE` (on by default in BSL, previously always-inert) to actually
+work now that their shared gating buffer holds real data.
+
+A sixth addition: `examples/_settings_panel.py`'s `SettingsPanel` renders the
+pack's *entire* Iris-style options menu (`ShaderOptions.menu_tree` — every
+screen/toggle/slider it declares) as a live, navigable DirectGUI panel in the
+demo (`[o]` to open) — change a value, watch `set_option()` + `recompile()`
+apply it in real time. Pure demo/dev-tool convenience on top of the existing
+engine-side options API; touches no pipeline internals.
+
+Remaining gaps, none of them wiring bugs — genuine fidelity/feature work:
+
 - **`shaders.properties`' custom-uniform DSL is hand-implemented, not
   evaluated generally.** `PipelineRenderer._day_cycle_uniforms` computes
   `worldTime` (animated), `timeAngle`, `shadowFade`, `timeBrightness`,
@@ -188,26 +248,20 @@ doesn't have yet (this part *is* fidelity work, not more wiring bugs):
   texture to this. Fixed with a per-name default override
   (`entityColor` → `(0,0,0,0)`, "no tint"). Confirmed: bamboo, tree
   branches, and an animated actor all render with their real textures now.
-- **Shadows don't appear.** Objects show correct directional lighting
-  gradients, but no visible ground-contact shadow ever appears. Extensively
-  investigated and *narrowed*, not fixed: the shadow depth map itself
-  contains correct, properly-warped geometry data; the hardware
-  depth-compare sampling mechanism works correctly when tested directly;
-  the pack's distortion formula is applied identically on both the render
-  and sample sides (not a mismatch, as an earlier pass here suspected); and
-  `shadowDistance`/`shadowMapResolution` match between the shader's `const`
-  declarations and the runner's actual shadow-camera setup. What's
-  confirmed broken: `GetShadow()`'s full computation returns "fully
-  occluded" almost everywhere on open, unobstructed ground — most likely
-  insufficient bias causing self-shadowing/acne, localized to
-  `shadows.glsl`'s bias math but not yet fixed. See the
-  `lighting-fidelity-daycycle-and-mystery` memory note for the full,
-  ruled-out-hypothesis list before re-investigating.
-- **Sky is not yet working.** BSL's sky needs either real sky-dome geometry
-  tagged `sky`/`sky_basic` (the demo scene has none) or the `SKY_DEFERRED`
-  pack option (off by default). Enabling `SKY_DEFERRED` + `SHADER_SUN_MOON`
-  was tested directly and still produced a solid black sky in every
-  direction — likely blocked on the same lighting-chain gaps as shadows.
+- **Shadow ground-contact visibility unconfirmed.** Predates the coordinate
+  fix above and is logically independent of it (`GetShadow`'s distortion/bias
+  math operates on shadow-space coordinates that are self-consistent
+  regardless of the Z-up/Y-up convention — see the fix's own writeup). Last
+  directly investigated: `GetShadow()`'s full computation returned "fully
+  occluded" almost everywhere on open, unobstructed ground, most likely
+  insufficient bias causing self-shadowing/acne in `shadows.glsl`'s bias
+  math. Needs re-verification post-fix before further investigation.
+- **Sky now renders** (`PipelineRenderer.build_sky()` attaches a
+  camera-following sphere tagged `sky_basic`; BSL's `gbuffers_skybasic.glsl`
+  computes the gradient/sun/moon/stars/aurora entirely from the
+  screen-space ray direction, so the geometry only needs to cover the sky).
+  **Clouds are not implemented** — BSL's cloud programs need real vertex
+  UVs/normals/a cloud texture, unlike the sky's purely-procedural approach.
 - **No exposure/tone-mapping tuning.** HDR sky content can clip to solid
   white; a look at BSL's exposure curve would go a long way.
 - **Gbuffer attachment count.** Panda3D binds at most 1 colour + 4 aux render

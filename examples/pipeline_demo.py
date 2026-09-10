@@ -29,16 +29,20 @@ from panda3d.core import TextNode, CardMaker
 from mcshader.engine import PipelineRenderer
 from _flycam import attach_fly_camera
 from _tagging import tag_by_pattern
+from _settings_panel import SettingsPanel
 
 HELP = """mcshader pipeline demo
 WASD/QE fly, arrows look, shift boost   [g] reset camera to the establishing shot
 [1][2][3] profile MINIMUM/HIGH/ULTRA
+[o] live shader settings panel (every option the pack exposes, tweak + see it apply)
 [z] toggle SHADOW option    [t] pause/resume the panda's walk
 [r] cycle the panda's render type
 [b] cycle the panda's block id
 [[ ]] step raw colortex buffers, [0] back to final
 [p] swap_pack() reload (tags survive)
 [k] screenshot   [h] hide/show this help"""
+
+_PROFILES = ["MINIMUM", "LOW", "MEDIUM", "HIGH", "ULTRA"]
 
 # A few blocks chosen to visibly exercise different pack behaviour (waving
 # foliage, an emissive light source, a plain block) via the same block-id API.
@@ -89,12 +93,21 @@ class Demo(ShowBase):
         self.actor.loop("walk")
         self._animating = True
 
+
         # Load the pack and shade the whole scene through its pipeline.
-        # MINIMUM avoids BSL's cross-frame-history-dependent effects (this
-        # runner doesn't have history buffers yet — see README) and renders
-        # noticeably cleaner; try [2]/[3] for HIGH/ULTRA once that lands.
+        # MINIMUM is still the lightest/cleanest profile, but HIGH/ULTRA's
+        # TAA/AO denoising (which leans on colortex2's cross-frame history)
+        # now actually converges over a few dozen frames instead of reading
+        # permanently-zero history — see README.
         self._profile_name = "MINIMUM"
         self.pipe = PipelineRenderer(self, pack_path, world="world0", profile=self._profile_name)
+        self.sky = self.pipe.build_sky()
+        # BSL ships the sun/moon disc off by default (an Iris video-settings
+        # default, not a technical limitation) — flip it on so there's
+        # something to actually see in the sky; toggle it back off (along
+        # with everything else) via the [o] settings panel.
+        self.pipe.set_option("SHADER_SUN_MOON", True)
+        self.pipe.recompile()
 
         tag_counts = tag_by_pattern(self.pipe, self.environ, _ENV_RULES, default="terrain")
 
@@ -108,6 +121,13 @@ class Demo(ShowBase):
         self._debug_names = list(self.pipe.debug_textures().keys())
         self._debug_index = -1  # -1 == normal composited final view
         self._debug_quad = self._build_debug_quad()
+
+        # The pack's whole Iris-style options menu (every screen/toggle/
+        # slider it declares), live: change a value, see it recompile and
+        # apply immediately.
+        self.settings = SettingsPanel(
+            self, self.pipe, profiles=_PROFILES, profile_name=self._profile_name,
+            on_change=self._on_settings_change)
 
         print(self.pipe.describe())
         print("tagged by pattern:", tag_counts)
@@ -134,6 +154,7 @@ class Demo(ShowBase):
         self.accept("k", self._screenshot)
         self.accept("h", self._toggle_help)
         self.accept("g", self._go_home)
+        self.accept("o", self.settings.toggle)
 
     def _go_home(self):
         self.cam.set_pos(*_HOME_POS)
@@ -182,9 +203,25 @@ class Demo(ShowBase):
     def _profile(self, name):
         self._profile_name = name
         self.pipe.apply_profile(name)
+        # apply_profile() resets every option to the profile's own defaults
+        # (BSL ships the sun/moon disc off) — reapply the demo's own default
+        # override, same as at startup.
+        self.pipe.set_option("SHADER_SUN_MOON", True)
+        self.pipe.recompile()
         self._debug_names = list(self.pipe.debug_textures().keys())
+        if hasattr(self, "settings"):
+            self.settings.set_profile_name(name)
         self._update_status()
         print(f"profile -> {name}")
+
+    def _on_settings_change(self):
+        """The settings panel just applied an option change (recompile()d
+        the pipeline) — colortex buffers are fresh objects, so the debug
+        viewer's texture references need refreshing too."""
+        self._debug_names = list(self.pipe.debug_textures().keys())
+        if self._debug_index >= 0:
+            self._cycle_debug(0)  # re-bind the currently-viewed buffer
+        self._update_status()
 
     def _toggle_shadow(self):
         self.pipe.set_option("SHADOW", not self.pipe.options.get("SHADOW"))
