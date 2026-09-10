@@ -98,7 +98,11 @@ python -m mcshader extract  Shaders/ gbuffers_terrain --out ./out
 ```
 
 Inspect a pack headlessly from Python with `examples/pipeline_describe.py`, or run
-the live demo with `examples/pipeline_demo.py` (needs `panda3d` + a display).
+the live demo with `examples/pipeline_demo.py` (needs `panda3d` + a display). The
+demo runs the pipeline over Panda3D's own bundled "environment" island (real
+ground/rock/tree/bamboo textures) plus an animated actor, tagged in bulk by name
+pattern via `examples/_tagging.py` — the same way a real game's assets would be
+tagged, not object-by-object.
 
 ## Honest limitations
 
@@ -168,21 +172,44 @@ doesn't have yet (this part *is* fidelity work, not more wiring bugs):
   concept of frame-to-frame buffer persistence yet, so these effects read
   garbage. The **MINIMUM** profile avoids most of this and looks noticeably
   cleaner — prefer it until history buffers land.
-- **No custom-uniform evaluator.** `shaders.properties` defines derived
-  uniforms (`timeBrightness`, `shadowFade`, biome flags, …) as a small
-  expression DSL; only the literal MC uniforms are fed, so anything pack-side
-  computed this way silently defaults to 0. This is the single biggest lever
-  left for lighting fidelity/day-night correctness — and its effect is now
-  directly visible: BSL's `terrain`/`entity` gbuffer programs run the full
-  `GetLighting()` PBR path, whose inputs (lightmap, sky/sun color) sum to
-  zero under the current defaults, so those objects render solid black;
-  `textured`/`block_entity` skip that path and render correctly (checkered,
-  lit). Run `examples/pipeline_demo.py` and compare its four differently-
-  tagged pillars to see this directly.
-- **No exposure/tone-mapping tuning.** HDR sky content clips to solid white
-  and unlit surfaces read near-black in the demo scene; real per-object
-  textures/materials (the demo uses flat-shaded primitives) and a look at
-  BSL's exposure curve would go a long way.
+- **`shaders.properties`' custom-uniform DSL is hand-implemented, not
+  evaluated generally.** `PipelineRenderer._day_cycle_uniforms` computes
+  `worldTime` (animated), `timeAngle`, `shadowFade`, `timeBrightness`,
+  `framemod8`/`framemod2` by copying this pack's specific formulas — a
+  real, verified fix (confirmed `shadowFade=1.0`/`timeBrightness=1.0` at
+  simulated noon). A general expression evaluator for arbitrary packs is
+  still not implemented.
+- **Entities/foliage were losing their real texture — fixed.** BSL's
+  `gbuffers_entities(_glowing)` does `albedo.rgb = mix(albedo.rgb,
+  entityColor.rgb, entityColor.a)`; the runner's generic default for an
+  unbound `vec4` uniform is `(0,0,0,1)`, and alpha=1 there means "always
+  fully overridden by black". Every `entity`-tagged object — foliage,
+  actors, anything not `terrain`/`textured`/`block_entity` — was losing its
+  texture to this. Fixed with a per-name default override
+  (`entityColor` → `(0,0,0,0)`, "no tint"). Confirmed: bamboo, tree
+  branches, and an animated actor all render with their real textures now.
+- **Shadows don't appear.** Objects show correct directional lighting
+  gradients, but no visible ground-contact shadow ever appears. Extensively
+  investigated and *narrowed*, not fixed: the shadow depth map itself
+  contains correct, properly-warped geometry data; the hardware
+  depth-compare sampling mechanism works correctly when tested directly;
+  the pack's distortion formula is applied identically on both the render
+  and sample sides (not a mismatch, as an earlier pass here suspected); and
+  `shadowDistance`/`shadowMapResolution` match between the shader's `const`
+  declarations and the runner's actual shadow-camera setup. What's
+  confirmed broken: `GetShadow()`'s full computation returns "fully
+  occluded" almost everywhere on open, unobstructed ground — most likely
+  insufficient bias causing self-shadowing/acne, localized to
+  `shadows.glsl`'s bias math but not yet fixed. See the
+  `lighting-fidelity-daycycle-and-mystery` memory note for the full,
+  ruled-out-hypothesis list before re-investigating.
+- **Sky is not yet working.** BSL's sky needs either real sky-dome geometry
+  tagged `sky`/`sky_basic` (the demo scene has none) or the `SKY_DEFERRED`
+  pack option (off by default). Enabling `SKY_DEFERRED` + `SHADER_SUN_MOON`
+  was tested directly and still produced a solid black sky in every
+  direction — likely blocked on the same lighting-chain gaps as shadows.
+- **No exposure/tone-mapping tuning.** HDR sky content can clip to solid
+  white; a look at BSL's exposure curve would go a long way.
 - **Gbuffer attachment count.** Panda3D binds at most 1 colour + 4 aux render
   targets, so the runner packs the distinct gbuffer `colortex` into ≤5
   attachment slots; a pack whose gbuffers write more than 5 distinct buffers

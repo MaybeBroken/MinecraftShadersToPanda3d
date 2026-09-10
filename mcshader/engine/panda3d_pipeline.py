@@ -333,17 +333,23 @@ class PipelineRenderer:
         dr = self._scene_buf.make_display_region()
         dr.set_camera(self.base.cam)
 
-    def _sun_direction(self) -> Any:
-        """World-space direction from the scene toward the sun.
+    def _sun_direction(self, time_angle: float = 0.25) -> Any:
+        """World-space direction from the scene toward the sun, at a given
+        ``timeAngle`` (0..1, the fraction of a day — see `_day_cycle_uniforms`).
 
-        No day/night cycle is modelled yet (see README), so this is a fixed
-        mid-morning angle shared by the shadow camera and the per-frame
-        sunPosition/shadowLightPosition uniforms, so shadows actually point
-        the way the lighting says they should.
+        Shares the shape of BSL's own in-shader sun-arc remap (see
+        ``lib/atmospherics/sunmoon.glsl``'s ``ang`` calculation) so the sun
+        rises/sets at roughly the same pace the shaders animate it at,
+        without needing this engine's Z-up world reconciled with Minecraft's
+        Y-up convention (out of scope here — this only drives *this* Python
+        side's shadow-camera placement, not the shaders' own sun/sky math).
         """
+        import math
         from panda3d.core import LVecBase3
 
-        d = LVecBase3(0.3, 0.6, 0.75)
+        ang = (time_angle + 0.0001 - 0.25) % 1.0
+        ang = (ang + (math.cos(ang * math.pi) * -0.5 + 0.5 - ang) / 3.0) * 2.0 * math.pi
+        d = LVecBase3(0.3, -math.sin(ang), math.cos(ang))
         d.normalize()
         return d
 
@@ -379,6 +385,7 @@ class PipelineRenderer:
             self._shadow_tex, GraphicsOutput.RTM_bind_or_copy, GraphicsOutput.RTP_depth)
         self._buffers.append(self._shadow_buf)
         dist = float(self.options.get("shadowDistance")) if "shadowDistance" in self.options.options else 256.0
+        self._shadow_dist = dist
         lens = OrthographicLens()
         lens.set_film_size(dist, dist)
         lens.set_near_far(1.0, dist * 2.0)
@@ -580,6 +587,49 @@ class PipelineRenderer:
         self.base.taskMgr.add(self._update, "mcshader-pipeline-uniforms")
         self._task_started = True
 
+    #: Real seconds per in-game day, driving worldTime (and everything derived
+    #: from it — sun position, sky colour, shadowFade) so lighting actually
+    #: changes instead of sitting at whatever a single fixed constant gave it.
+    _DAY_LENGTH_SECONDS = 120.0
+
+    def _day_cycle_uniforms(self, t: float, frame_count: int) -> dict[str, Any]:
+        """The handful of ``shaders.properties`` custom uniforms BSL actually
+        needs (see shaders.properties' "Custom Time/Blindness/Frame Jitter
+        Uniform" blocks) — hand-evaluated rather than through a general
+        expression-DSL evaluator (not implemented), since this pack only
+        needs this fixed, small set. Formulas copied verbatim from
+        Shaders/shaders/shaders.properties.
+
+        Getting these fed at all matters far more than getting worldTime's
+        pacing "authentic": left at their generic zero default, `shadowFade`
+        zeroes the direct-light term in BSL's `GetLighting()` (`shadowMult =
+        shadowFade * ...`), which is why terrain/entities rendered solid
+        black — an ambient-only, un-lit-by-the-sun scene is indistinguishable
+        from a broken one.
+        """
+        import math
+
+        world_time = (t / self._DAY_LENGTH_SECONDS * 24000.0) % 24000.0
+        time_angle = world_time / 24000.0
+
+        def clamp01(x: float) -> float:
+            return max(0.0, min(1.0, x))
+
+        shadow_fade_out1 = clamp01((world_time - 12330) / 230)
+        shadow_fade_in1 = clamp01((world_time - 13010) / 220)
+        shadow_fade_out2 = clamp01((world_time - 22770) / 220)
+        shadow_fade_in2 = clamp01((world_time - 23440) / 230)
+        shadow_fade = 1.0 - (shadow_fade_out1 - shadow_fade_in1 + shadow_fade_out2 - shadow_fade_in2)
+        time_brightness = max(math.sin(time_angle * 2.0 * math.pi), 0.0)
+
+        return {
+            "worldTime": world_time, "worldDay": int(world_time // 24000),
+            "sunAngle": time_angle, "timeAngle": time_angle,
+            "shadowFade": shadow_fade, "timeBrightness": time_brightness,
+            "framemod8": float(frame_count % 8), "framemod2": float(frame_count % 2),
+            "blindFactor": 0.0, "blindness": 0.0, "moonPhase": 0,
+        }
+
     def _dynamic_uniforms(self) -> dict[str, Any]:
         """Compute the frame-varying uniform values we can derive from the scene."""
         from panda3d.core import ClockObject, LMatrix4, LVecBase3
@@ -599,12 +649,21 @@ class PipelineRenderer:
         proj = LMatrix4(lens.get_projection_mat())
         proj_inv = LMatrix4(proj); proj_inv.invert_in_place()
         cam_pos = cam_np.get_pos(render)
-        sun_world = self._sun_direction()
+        frame_count = int(clock.get_frame_count())
+        day = self._day_cycle_uniforms(t, frame_count)
+        sun_world = self._sun_direction(day["timeAngle"])
         sun_view = mv.xform_vec(sun_world) * 100.0
         up_view = mv.xform_vec(LVecBase3(0, 0, 1)) * 100.0
 
         shadow_cam_np = getattr(self, "_shadow_cam", None)
         if shadow_cam_np is not None:
+            # Track the moving sun so the shadow map (and the shadowModelView/
+            # Projection derived from it below) keeps matching the lighting
+            # direction the day cycle now animates, instead of staying fixed
+            # at wherever the sun was when the pipeline was first built.
+            dist = getattr(self, "_shadow_dist", 256.0)
+            shadow_cam_np.set_pos(sun_world * (dist * 0.5))
+            shadow_cam_np.look_at(0, 0, 0)
             s_mv = render.get_mat(shadow_cam_np)
             s_mv_inv = shadow_cam_np.get_mat(render)
             s_proj = LMatrix4(shadow_cam_np.node().get_lens().get_projection_mat())
@@ -613,10 +672,10 @@ class PipelineRenderer:
             s_mv, s_mv_inv, s_proj, s_proj_inv = mv, mv_inv, proj, proj_inv
         return {
             "frameTimeCounter": t, "frameTime": clock.get_dt(),
-            "frameCounter": int(clock.get_frame_count()),
+            "frameCounter": frame_count,
             "viewWidth": w, "viewHeight": h, "aspectRatio": w / max(h, 1.0),
             "near": lens.get_near(), "far": lens.get_far(),
-            "sunAngle": 0.25, "timeAngle": 0.25, "rainStrength": 0.0, "wetness": 0.0,
+            **day, "rainStrength": 0.0, "wetness": 0.0,
             "cameraPosition": cam_pos, "previousCameraPosition": cam_pos,
             "gbufferModelView": mv, "gbufferModelViewInverse": mv_inv,
             "gbufferPreviousModelView": mv,
@@ -627,6 +686,16 @@ class PipelineRenderer:
             "sunPosition": sun_view, "moonPosition": sun_view * -1.0,
             "shadowLightPosition": sun_view, "upPosition": up_view,
         }
+
+    # Uniforms whose semantically-correct "unbound" default differs from the
+    # generic per-type default below — e.g. entityColor is a (tint, blend)
+    # pair consumed as `mix(albedo, entityColor.rgb, entityColor.a)`; alpha=0
+    # means "no tint, keep the real texture", but the generic vec4 default's
+    # alpha=1 means "always fully overridden by black", blacking out every
+    # entity/actor regardless of its own texture.
+    _NAMED_DEFAULTS = {
+        "entityColor": (0.0, 0.0, 0.0, 0.0),
+    }
 
     def _default_for(self, gtype: str) -> Any:
         from panda3d.core import (LMatrix3, LMatrix4, LVecBase2, LVecBase3, LVecBase4,
@@ -648,6 +717,8 @@ class PipelineRenderer:
         for node in [self.base.render] + self._quads:
             for name, gtype in self._uniform_types.items():
                 value = dynamic.get(name)
+                if value is None:
+                    value = self._NAMED_DEFAULTS.get(name)
                 if value is None:
                     value = self._default_for(gtype)
                 node.set_shader_input(name, value)

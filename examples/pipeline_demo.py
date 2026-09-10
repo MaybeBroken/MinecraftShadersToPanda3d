@@ -1,10 +1,14 @@
-"""Run a Minecraft shaderpack's deferred pipeline over a Panda3D scene.
+"""Run a Minecraft shaderpack's deferred pipeline over a real Panda3D scene.
 
     pip install panda3d
     python examples/pipeline_demo.py [path-to-pack]
 
-Tags each object with a Minecraft render type and lets the pack shade the
-whole frame (shadow -> gbuffers -> deferred -> composite -> final). Fly
+Uses Panda3D's own bundled tutorial content — the "environment" island (real
+ground/rock/tree/bamboo textures, ~90 pieces of actual geometry) and the
+animated panda actor — instead of hand-placed primitives, tagged in bulk by
+name pattern (see `_tagging.py`) the way a real game's assets would be: by
+naming convention, not object-by-object. Lets the pack shade the whole frame
+(shadow -> gbuffers -> deferred -> composite -> final) over that scene. Fly
 around and poke at it live — profiles, options, render types, block ids, a
 raw-buffer viewer, a pack reload — instead of trusting a single screenshot;
 see the on-screen help (also printed to the console) for every control.
@@ -18,19 +22,20 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
   # noqa: E402 (run from a source checkout without installing)
 
 from direct.showbase.ShowBase import ShowBase
+from direct.actor.Actor import Actor
 from direct.gui.OnscreenText import OnscreenText
 from panda3d.core import TextNode, CardMaker
 
 from mcshader.engine import PipelineRenderer
 from _flycam import attach_fly_camera
-from _checker import make_checker_texture
+from _tagging import tag_by_pattern
 
 HELP = """mcshader pipeline demo
 WASD/QE fly, arrows look, shift boost   [g] reset camera to the establishing shot
 [1][2][3] profile MINIMUM/HIGH/ULTRA
-[z] toggle SHADOW option
-[r] cycle crystal's render type
-[b] cycle crystal's block id
+[z] toggle SHADOW option    [t] pause/resume the panda's walk
+[r] cycle the panda's render type
+[b] cycle the panda's block id
 [[ ]] step raw colortex buffers, [0] back to final
 [p] swap_pack() reload (tags survive)
 [k] screenshot   [h] hide/show this help"""
@@ -39,18 +44,21 @@ WASD/QE fly, arrows look, shift boost   [g] reset camera to the establishing sho
 # foliage, an emissive light source, a plain block) via the same block-id API.
 _BLOCKS = ["minecraft:sea_lantern", "minecraft:oak_leaves", "minecraft:stone"]
 
-_HOME_POS = (18, -26, 12)
-_HOME_LOOK = (0, 0, 1)
+_HOME_POS = (0, -170, 55)
+_HOME_LOOK = (0, 20, 10)
 
-# name, pos, scale, render_type — four pillars of different heights spread
-# around the ground so there's actually something to judge shading, shadows,
-# and parallax against; a single flat plane and two small cubes (the old
-# scene) don't give enough to look at to tell whether anything is working.
-_PILLARS = [
-    ("pillar_nw", (-7, 6, 0.5), (1.5, 1.5, 3), "terrain"),
-    ("pillar_ne", (7, 6, 1.5), (1.5, 1.5, 5), "block_entity"),
-    ("pillar_sw", (-7, -2, 0), (1.5, 1.5, 2), "entity"),
-    ("pillar_se", (7, -2, 1), (1.5, 1.5, 4), "textured"),
+# Bulk-tag rules for Panda3D's bundled "environment" island model, tried in
+# order against each GeomNode's name — the realistic way a scene with ~90
+# pieces of geometry gets tagged (by naming convention), not by hand-picking
+# every object. Ground gets the real terrain program; rocks and tree trunks
+# are opaque static geometry; bamboo/branches/reed "planes" all carry Panda's
+# own TransparencyAttrib (they're alpha-cut leaf cards) so "entity" — the
+# render type actual foliage-waving programs key off — fits them best.
+_ENV_RULES = [
+    (r"^Ground", "terrain"),
+    (r"^Rock", "block_entity"),
+    (r"^TreeTrunk", "block_entity"),
+    (r"^(Branch|Bamboo|Plane|Cylinder)", "entity"),
 ]
 
 
@@ -61,37 +69,25 @@ class Demo(ShowBase):
 
         self.cam.set_pos(*_HOME_POS)
         self.cam.look_at(*_HOME_LOOK)
-        attach_fly_camera(self)
+        attach_fly_camera(self, speed=40.0)
 
-        checker = make_checker_texture()
+        # The classic Panda3D tutorial island: real textures (ground, rock,
+        # tree bark, bamboo, reeds) on real geometry, at the scale/position
+        # from Panda3D's own "Hello World" tutorial.
+        self.environ = self.loader.load_model("models/environment")
+        self.environ.reparent_to(self.render)
+        self.environ.set_scale(0.25, 0.25, 0.25)
+        self.environ.set_pos(-8, 42, 0)
 
-        # A big checkered plate: gives an unambiguous visual reference for
-        # orientation, perspective, and whether lighting actually varies
-        # across a lit surface (vs. one flat, unlit colour).
-        self.ground = self.loader.load_model("models/misc/rgbCube")
-        self.ground.reparent_to(self.render)
-        self.ground.set_scale(30, 30, 0.2)
-        self.ground.set_pos(0, 0, -1)
-        self.ground.set_texture(checker, 1)
-
-        self._pillars = []
-        for _name, pos, scale, render_type in _PILLARS:
-            pillar = self.loader.load_model("models/misc/rgbCube")
-            pillar.reparent_to(self.render)
-            pillar.set_scale(*scale)
-            pillar.set_pos(*pos)
-            pillar.set_texture(checker, 1)
-            self._pillars.append((pillar, render_type))
-
-        self.crystal = self.loader.load_model("models/misc/rgbCube")
-        self.crystal.reparent_to(self.render)
-        self.crystal.set_pos(0, 4, 0.5)
-        self.crystal.set_scale(1.2)
-
-        self.water = self.loader.load_model("models/misc/rgbCube")
-        self.water.reparent_to(self.render)
-        self.water.set_scale(9, 9, 0.1)
-        self.water.set_pos(0, -14, -0.85)
+        # An animated character actor — proves the pipeline shades skinned,
+        # moving geometry correctly, not just static props.
+        self.actor = Actor("models/panda-model", {"walk": "models/panda-walk4"})
+        self.actor.reparent_to(self.render)
+        self.actor.set_scale(0.005)
+        self.actor.set_pos(0, 20, 0)
+        self.actor.set_h(180)
+        self.actor.loop("walk")
+        self._animating = True
 
         # Load the pack and shade the whole scene through its pipeline.
         # MINIMUM avoids BSL's cross-frame-history-dependent effects (this
@@ -99,15 +95,14 @@ class Demo(ShowBase):
         # noticeably cleaner; try [2]/[3] for HIGH/ULTRA once that lands.
         self._profile_name = "MINIMUM"
         self.pipe = PipelineRenderer(self, pack_path, world="world0", profile=self._profile_name)
-        self.pipe.set_render_type(self.ground, "terrain")
-        self.pipe.set_render_type(self.water, "water")
-        for pillar, render_type in self._pillars:
-            self.pipe.set_render_type(pillar, render_type)
+
+        tag_counts = tag_by_pattern(self.pipe, self.environ, _ENV_RULES, default="terrain")
 
         self._render_types = self.pipe.resolver.types()
-        self._rt_index = self._render_types.index("glowing") if "glowing" in self._render_types else 0
+        self._rt_index = self._render_types.index("entity") if "entity" in self._render_types else 0
         self._block_index = 0
-        self.pipe.set_render_type(self.crystal, self._render_types[self._rt_index])
+        self.pipe.set_render_type(self.actor, self._render_types[self._rt_index])
+        tag_counts[self._render_types[self._rt_index]] = tag_counts.get(self._render_types[self._rt_index], 0) + 1
         self._apply_block()
 
         self._debug_names = list(self.pipe.debug_textures().keys())
@@ -115,6 +110,7 @@ class Demo(ShowBase):
         self._debug_quad = self._build_debug_quad()
 
         print(self.pipe.describe())
+        print("tagged by pattern:", tag_counts)
         print("\n" + HELP)
         self._help_text = OnscreenText(
             text=HELP, pos=(-1.3, 0.95), scale=0.045, align=TextNode.ALeft,
@@ -128,6 +124,7 @@ class Demo(ShowBase):
         self.accept("2", self._profile, ["HIGH"])
         self.accept("3", self._profile, ["ULTRA"])
         self.accept("z", self._toggle_shadow)
+        self.accept("t", self._toggle_animation)
         self.accept("r", self._cycle_render_type)
         self.accept("b", self._cycle_block)
         self.accept("[", self._cycle_debug, [-1])
@@ -142,6 +139,15 @@ class Demo(ShowBase):
         self.cam.set_pos(*_HOME_POS)
         self.cam.look_at(*_HOME_LOOK)
         print("camera reset to the establishing shot")
+
+    def _toggle_animation(self):
+        self._animating = not self._animating
+        if self._animating:
+            self.actor.loop("walk")
+        else:
+            self.actor.stop()
+        self._update_status()
+        print("panda animation ->", "playing" if self._animating else "paused")
 
     # -- raw buffer viewer -------------------------------------------------
     def _build_debug_quad(self):
@@ -189,20 +195,20 @@ class Demo(ShowBase):
     def _cycle_render_type(self):
         self._rt_index = (self._rt_index + 1) % len(self._render_types)
         rt = self._render_types[self._rt_index]
-        self.pipe.set_render_type(self.crystal, rt)
+        self.pipe.set_render_type(self.actor, rt)
         self._apply_block()  # set_render_type alone doesn't reapply the block id
         self._update_status()
-        print("crystal render_type ->", rt)
+        print("panda render_type ->", rt)
 
     def _cycle_block(self):
         self._block_index = (self._block_index + 1) % len(_BLOCKS)
         self._apply_block()
         self._update_status()
-        print("crystal block ->", _BLOCKS[self._block_index])
+        print("panda block ->", _BLOCKS[self._block_index])
 
     def _apply_block(self):
         mc_id = _BLOCKS[self._block_index]
-        self.pipe.set_block_id(self.crystal, self.pipe.resolver.block_id(mc_id))
+        self.pipe.set_block_id(self.actor, self.pipe.resolver.block_id(mc_id))
 
     def _swap_pack(self):
         self.pipe.swap_pack(self._pack_path)
@@ -227,7 +233,7 @@ class Demo(ShowBase):
         view = self._debug_names[self._debug_index] if self._debug_index >= 0 else "final"
         self._status_text.setText(
             f"profile={self._profile_name}  shadow={self.pipe.options.get('SHADOW')}  "
-            f"crystal={rt}/{block}  view={view}"
+            f"panda={rt}/{block}  view={view}"
         )
 
 
