@@ -228,7 +228,233 @@ pack's *entire* Iris-style options menu (`ShaderOptions.menu_tree` — every
 screen/toggle/slider it declares) as a live, navigable DirectGUI panel in the
 demo (`[o]` to open) — change a value, watch `set_option()` + `recompile()`
 apply it in real time. Pure demo/dev-tool convenience on top of the existing
-engine-side options API; touches no pipeline internals.
+engine-side options API; touches no pipeline internals. Its panel is docked
+against the window's *actual* aspect ratio (`SettingsPanel._reposition`,
+re-run on every `window-event`) rather than a fixed literal tuned for a wide
+window — the fixed version left roughly a third of the panel clipped off the
+right edge of Panda3D's own 800x600 default window.
+
+A seventh pass found the single bug behind four separate symptoms — broken
+shadows, screen-space effects not lining up with the camera, and (per report)
+"nothing mapping to the camera right, might be FOV": **`gbufferProjection`/
+`shadowProjection` were fed Panda's *native* projection matrix, in a
+different convention than BSL's own code assumes.** Confirmed numerically:
+Panda's `lens.get_projection_mat()` depends on `lens.get_coordinate_system()`
+— left at Panda's default (`CS_zup_right`, matching the engine's native
+Y-forward/Z-up camera space) it returns a mathematically valid but
+differently-*shaped* matrix than the standard OpenGL one (`CS_yup_right`) a
+lens with that coordinate system set explicitly returns; verified by
+reconstructing the latter as `cs_yup_to_zup * <native matrix>` and checking
+it against Panda's own `CS_yup_right` output (exact match, both for
+`PerspectiveLens` and the shadow camera's `OrthographicLens`). That
+distinction is invisible to code that only ever multiplies the full
+matrix — but a good deal of BSL's own code doesn't: `ToNDC`/`ToShadow`'s
+`projMAD`/`diagonal3` macros (`lib/util/spaceConversion.glsl`) and
+`GetLinearDepth` (used throughout AO, light shafts, outlines, and
+`shadows.glsl`'s `GetShadow`) all read specific *cells* of the projection
+matrix assuming the standard sparse layout — Panda's native matrix puts the
+same terms in different cells, so those shortcuts silently read zeros
+instead of the real depth/aspect terms. Fixed by reconstructing the
+standard-convention matrix (`cs_yup_to_zup * <native>`) for both
+`gbufferProjection` and `shadowProjection`, and correspondingly folding an
+extra `cs_yup_to_zup` rotation into `gbufferModelView`/`shadowModelView` so
+both halves of every `projection * modelview` pair agree on the same "view
+space" (previously they silently didn't, even though each half looked
+internally plausible on its own). Confirmed by rendering the real demo scene
+offscreen on the actual test hardware, before and after, at the same camera
+pose: terrain/rocks/sky went from solid black (the long-standing
+unexplained "black pillar"/no-sky/no-shadow symptom) to correctly lit with a
+clearly visible cast shadow next to a rock cluster, matching the sun
+direction. The `MEDIUM` profile (shadows + AO + `SHADOW_FILTER`, no
+`LIGHT_SHAFT`/`TAA`) is the cleanest demonstration of this fix.
+
+The same pass fixed a second, independent bug behind the persistent
+"static"/noisy look: **`gbufferPreviousModelView`/`gbufferPreviousProjection`/
+`previousCameraPosition` were fed *this* frame's values, not last frame's.**
+`taa.glsl`'s `Reprojection()` (and the multicolored-blocklight/SSR code that
+reuses the same pattern) computes `cameraOffset = cameraPosition -
+previousCameraPosition` and reprojects through the *previous* frame's
+matrices to find where a world point was on screen a frame ago; feeding it
+identical current/previous values made `cameraOffset` permanently zero and
+the reprojection a no-op regardless of real camera motion, so temporal
+blending mixed each new frame with a history texel that (whenever the camera
+had actually moved) represented a different world point. `PipelineRenderer`
+now caches the previous call's `gbufferModelView`/`gbufferProjection`/
+`cameraPosition` and feeds those, one frame behind, instead of duplicating
+the current frame's values.
+
+**A newly-found, separate, pre-existing bug, not fixed this pass:** with
+`TAA` on (the default at `HIGH`/`ULTRA`), `composite7`'s `TemporalAA()`
+renders `terrain`/`block_entity`-tagged geometry solid black while
+`entity`-tagged geometry (foliage, actors) stays correctly lit — confirmed
+present before the projection-matrix fix too (bisected against a stashed
+pre-fix build), so it isn't a regression from the work above. Bisected by
+selectively disabling each option `HIGH` adds over a verified-good `MEDIUM`
+baseline (`AO`, `SHADOW_FILTER`, `LIGHT_SHAFT`, `SHADOW_COLOR`, `TAA`
+individually): only `TAA` reproduces it. Further bisected *inside*
+`TemporalAA()` by patching the compiled shader to bypass pieces of it one at
+a time: forcing `prvCoord = texCoord` (skipping `Reprojection()` entirely)
+does **not** fix it, and outputting the raw `textureCatmullRom(colortex2,
+prvCoord, view)` sample directly shows it's already black *before*
+`NeighbourhoodClipping`/`ClipAABB` or the final blend ever run — so the bug
+is that `colortex2`'s persisted TAA-history channels (`.gba`) are
+genuinely, persistently black for these pixels, and `ClipAABB` isn't
+correcting it back into the current frame's valid color range the way its
+own logic implies it should once contaminated. Leading unconfirmed
+hypothesis: a NaN entering `colortex2` on an early frame (composite5's
+`temporalData = mix(sqrt(exposure), tempExposure, ...)` computing
+`sqrt` of a negative intermediate is one plausible source) would explain
+every observation — it fails the `tempColor == vec3(0.0)` fallback check
+(`NaN != 0.0`), and `ClipAABB`'s own `if (ma_unit > 1.0)` guard is false for
+a NaN `ma_unit` (all comparisons with NaN are false), so it falls through to
+`return q` and passes the contamination straight through unclipped, forever
+self-sustaining in the persistent buffer — but this was not confirmed before
+the investigation budget for this pass ran out. Until fixed, prefer
+`MEDIUM` profile (or `pipe.set_option("TAA", False); pipe.recompile()`) over
+`HIGH`/`ULTRA`.
+
+**Cross-pack portability: first real bugs found testing a second pack.**
+Everything above was validated against BSL only; pointed at Complementary
+Unbound (`Shaders/ComplementaryUnbound.zip`) for the first time, the runner
+crashed outright. Three genuine, BSL-blind-spot bugs, all fixed in
+`mcshader/glsl/dialect.py` and `panda3d_pipeline.py`, none of them
+Complementary-specific hacks:
+
+- **OptiFine/Iris "uniform with a fallback" initializers weren't stripped.**
+  `uniform bool heavyFog = false;` is legal in a pack's own source (the value
+  is a default for when the engine doesn't recognise the name) but not in
+  real GLSL; left in place, our own uniform recorder captured `"heavyFog =
+  false"` as a name instead of `heavyFog`, so nothing ever bound it and
+  Panda3D asserted `Shader input heavyFog is not present`. `dialect.py` now
+  strips the initializer from any `uniform TYPE NAME = ...;` declaration
+  before translation.
+- **`gl_Fog.*` (legacy fixed-function fog state) had no translation.**
+  BSL never uses it; Complementary reads `gl_Fog.start/.end/.density/.color`
+  to blend with vanilla fog, and it has no core-profile declaration, so the
+  fragment shader failed to compile (`gl_Fog undeclared`). `dialect.py` now
+  rewrites each member to the real Minecraft uniform it mirrors
+  (`fogStart`/`fogEnd`/`fogDensity`/`fogColor`), injecting a declaration
+  only for whichever of those the pack hadn't already declared itself
+  (`fogColor` usually was; the others never had a reason to be).
+- **Computed uniform values weren't coerced to the pack's own declared
+  type.** `_day_cycle_uniforms` produces `worldTime` as a Python `float`
+  (fine for BSL, which declares it `float`); Complementary declares it
+  `int` (Minecraft's actual convention), and Panda3D's `set_shader_input`
+  errors outright on a type mismatch rather than truncating
+  (`Cannot pass floating-point data to integer shader input`).
+  `PipelineRenderer._coerce` now casts a computed value to match whatever
+  GLSL type *this* pack actually declared before feeding it, instead of
+  assuming BSL's declared type is universal.
+
+A follow-up pass, asked to make the *whole* pack work (not just stop
+crashing), found the actual reason its render looked flat/wrong even after
+the above: **`shaders.properties`' own `#if`/`#else`/`#endif` preprocessor
+blocks were never evaluated.** BSL's `shaders.properties` never uses them, so
+this was invisible; every line was read unconditionally (`#` was treated as
+a plain end-of-line comment, same as vanilla `.properties`). Complementary
+gates several `program.*.enabled` lines this way — critically
+`#if SHADOW_QUALITY == -1 / program.world0/shadow.enabled=false / #endif` —
+and reading that unconditionally permanently disabled the shadow program
+regardless of `SHADOW_QUALITY`'s real value (2 by default, not -1). Two
+fixes, both in `mcshader/pack/properties.py`:
+
+- `eval_condition` (the same evaluator `program.*.enabled` expressions
+  already used) gained comparison operators (`==`/`!=`/`<`/`>`/`<=`/`>=`)
+  against numeric option values — BSL's own `program.*.enabled` expressions
+  never needed more than `&&`/`||`/`!` over boolean toggles, but a
+  `.properties`-file-level `#if` is a richer grammar. Moved here from
+  `pipeline/graph.py` (which now imports it back) so `pack/` doesn't have to
+  depend on `pipeline/` to preprocess its own conditional blocks.
+- `parse_properties`/`read_pairs` now take the pack's current option values
+  and resolve `#if`/`#ifdef`/`#ifndef`/`#else`/`#endif` blocks before parsing
+  key=value lines. Re-evaluated on every rebuild (`PipelineRenderer.recompile`
+  now re-parses `shaders.properties` with the live option values, not just
+  once at load), matching OptiFine/Iris re-resolving these on every shader
+  reload — so flipping the relevant option later (`SHADOW_QUALITY` back to
+  `-1`, say) correctly disables the program again, not just at startup.
+
+Also fixed along the way: `_build_shadow_pass` compiled the `shadow` program
+twice — once correctly with `mode="gbuffer"` just to check it exists, then
+again with the *default* mode (`"compact"`, meant for fullscreen quads, not
+real scene geometry) for the shader actually bound to the shadow camera.
+Harmless for BSL (`shadow.glsl` only ever writes `gl_FragData[0]`, where both
+modes number identically) but wrong in general and wasteful either way; now
+compiled once and reused. And two `examples/pipeline_demo.py` GUI bugs
+assuming every pack has a `SHADOW` toggle option by that exact name
+(Complementary gates shadows on the numeric `SHADOW_QUALITY` instead): `[z]`
+(toggle shadow) raised a bare `KeyError`, and the on-screen status HUD had
+lost its `setText` call entirely (computed the status string, never
+displayed it) — both fixed to degrade to `"n/a"` for a pack without that
+option instead of crashing/silently doing nothing.
+
+**Still open, and worse than first assessed: an intermittent GL link failure
+(`vertex shader lacks 'main'`) that takes the whole app down**, not a benign
+warning — confirmed directly on real hardware with the actual
+`examples/pipeline_demo.py` window (not a headless script): the window opens
+and renders, then dies with no Python traceback partway through the first
+run, roughly half the time, not tied to any one program or profile found so
+far. One real, general bug fixed while chasing it — `resolve_includes`
+(`mcshader/glsl/preprocess.py`) only broke *cycles* (A includes B includes
+A), not the far more common "diamond" case (two unrelated files both
+`#include` the same shared `lib/` file), so a file could get textually
+re-expanded many times over through a deep include graph; confirmed this
+inflated Complementary's combined sources to 10,000+ lines each. Real
+Iris/OptiFine `#include` expands each file at most once per program (like
+`#pragma once`); `resolve_includes` now does too (tracks every path already
+expanded anywhere in the call tree, not just on the current branch),
+shrinking `gbuffers_terrain` from ~10,460 to ~8,830 lines and `composite`
+from ~12,380 to ~9,730 — real, and possibly relevant to a compiler choking on
+an oversized source, but **not confirmed to be the fix**: the crash still
+needs to be reproduced and pinned to a specific program before it can be
+called fixed. Whoever picks this up next: don't trust a single run either
+way (it's intermittent) — reproduce it a few times first, then bisect by
+disabling one program's compile at a time (`PipelineRenderer._compile`) to
+find which one, before assuming any particular cause.
+
+## Demo GUI fixes (pack on/off toggle + button-interaction bugs)
+
+Went through `examples/pipeline_demo.py` and `examples/_settings_panel.py`
+looking for buttons/hotkeys that don't do what they claim, and added the
+requested pack on/off toggle:
+
+- **New `[y]` hotkey and `PipelineRenderer.set_enabled(bool)`** — toggles
+  between the pack's full shaded output and Panda3D's own plain rendering of
+  the *same* tagged scene, live, without reloading anything. The offscreen
+  gbuffer/composite chain keeps running underneath either way; disabling
+  just hides the final composited quad(s) (so the window falls through to
+  Panda's own default display region) and clears every tagged NodePath's
+  shader (since that default display region draws the same scene graph, so
+  what's actually on the geometry is what determines its look there).
+  `set_render_type` now also respects a standing `set_enabled(False)`, so a
+  rebuild (option change, profile switch, `swap_pack()`) while the pack is
+  toggled off doesn't silently re-shade things.
+- **`[1]`-`[5]` profile keys were compiling everything twice.**
+  `PipelineRenderer.apply_profile()` already calls `recompile()` internally;
+  the demo's `_profile()` called it *again* right after — every profile
+  hotkey rebuilt every gbuffers/composite program and every buffer twice for
+  no reason. Also deleted a stale comment left over from a since-removed
+  `SHADER_SUN_MOON` override it no longer described.
+- **The settings panel's own profile stepper (`< >` on the "profile:" row)
+  desynced the HUD.** Changing profile through the panel updates
+  `pipe.options` correctly but never told the demo, so the on-screen
+  `profile=` label kept showing whatever was last set via `[1]`-`[5]` (or
+  the startup default) regardless of what was actually applied. Added a
+  `SettingsPanel.profile_name` property and now resync the demo's own
+  `_profile_name` from it on every settings-panel change.
+- **`[p]` (`swap_pack()`) silently reset the profile.** `load_pack()` was
+  called with no `profile` argument on a pack swap, dropping back to the new
+  pack's raw per-option defaults regardless of what profile (MINIMUM..ULTRA)
+  was active — "tags survive" was true, the profile selection wasn't, and
+  nothing in the GUI reflected the reset. `PipelineRenderer` now tracks its
+  own `profile_name` (set on load/`apply_profile`) and `swap_pack()` passes
+  it through.
+
+Complementary's actual visual *fidelity* (it does voxel GI and ships
+compute-shader programs — `.csh` —
+this pipeline has no compute-dispatch machinery for at all, so anything
+depending on those degrades to whatever fallback its shaders happen to fall
+back to) has not been assessed — that needs a human actually looking at the
+live GUI, not a headless screenshot diff.
 
 Remaining gaps, none of them wiring bugs — genuine fidelity/feature work:
 
@@ -248,14 +474,13 @@ Remaining gaps, none of them wiring bugs — genuine fidelity/feature work:
   texture to this. Fixed with a per-name default override
   (`entityColor` → `(0,0,0,0)`, "no tint"). Confirmed: bamboo, tree
   branches, and an animated actor all render with their real textures now.
-- **Shadow ground-contact visibility unconfirmed.** Predates the coordinate
-  fix above and is logically independent of it (`GetShadow`'s distortion/bias
-  math operates on shadow-space coordinates that are self-consistent
-  regardless of the Z-up/Y-up convention — see the fix's own writeup). Last
-  directly investigated: `GetShadow()`'s full computation returned "fully
-  occluded" almost everywhere on open, unobstructed ground, most likely
-  insufficient bias causing self-shadowing/acne in `shadows.glsl`'s bias
-  math. Needs re-verification post-fix before further investigation.
+- **Shadow ground-contact visibility — confirmed working.** The
+  `GetShadow()`/`GetLinearDepth` "fully occluded everywhere" symptom
+  previously suspected to be a bias problem was actually the projection-matrix
+  convention bug described in the seventh pass above (`ToShadow`'s
+  `projMAD`/`diagonal3` shortcut was reading the wrong matrix cells). Fixed
+  there; visually confirmed via an on-hardware screenshot showing a clear
+  cast shadow next to a rock cluster.
 - **Sky now renders** (`PipelineRenderer.build_sky()` attaches a
   camera-following sphere tagged `sky_basic`; BSL's `gbuffers_skybasic.glsl`
   computes the gradient/sun/moon/stars/aurora entirely from the

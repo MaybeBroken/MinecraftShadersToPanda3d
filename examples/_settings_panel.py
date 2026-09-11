@@ -2,10 +2,13 @@
 
 Renders the pack's own Iris-style options menu (``ShaderOptions.menu_tree`` —
 the same screens/toggles/sliders OptiFine/Iris would show in their video
-settings) as a navigable DirectGUI panel, and applies every change
-immediately via ``pipe.set_option()`` + ``pipe.recompile()`` — so you can
-tweak a shader `#define`/`const` value and see its effect in real time,
-without editing GLSL or restarting.
+settings) as a navigable DirectGUI panel. Edits are *staged* locally as you
+click/drag — nothing reaches the pipeline until you press "Apply Changes",
+which is when ``pipe.set_option()`` (or ``pipe.apply_profile()``) and
+``pipe.recompile()`` actually run. This mirrors Iris/OptiFine's own video
+settings screen (which batches edits behind a "Done" button) and, since
+``recompile()`` rebuilds the whole shader graph, avoids paying that cost on
+every single click.
 
     from _settings_panel import SettingsPanel
     panel = SettingsPanel(base, pipe, profiles=["MINIMUM", "LOW", "MEDIUM", "HIGH", "ULTRA"])
@@ -19,8 +22,8 @@ machinery, and nothing here touches shader source directly.
 from __future__ import annotations
 
 from direct.gui.DirectGui import (
-    DGG, DirectButton, DirectCheckButton, DirectFrame, DirectLabel,
-    DirectScrolledFrame,
+    DGG, DirectButton, DirectFrame, DirectLabel, DirectScrolledFrame,
+    DirectSlider,
 )
 from panda3d.core import TextNode
 
@@ -29,14 +32,28 @@ __all__ = ["SettingsPanel"]
 _ROW_H = 0.062
 _PANEL_L, _PANEL_R = -0.68, 0.72
 _ROW_INSET = 0.06
+_ROW_W = _PANEL_R - _PANEL_L - 0.02
+_SCROLL_TOP = 0.74
+_SCROLL_BOTTOM = -0.74
+
 _TEXT_COLOR = (0.92, 0.92, 0.92, 1)
 _DIM_COLOR = (0.55, 0.55, 0.55, 1)
+_MODIFIED_COLOR = (0.95, 0.78, 0.25, 1)
 _BTN_COLOR = (0.22, 0.22, 0.22, 1)
 _SCREEN_COLOR = (0.30, 0.42, 0.55, 1)
+_TOGGLE_ON_COLOR = (0.20, 0.45, 0.28, 1)
+_TOGGLE_OFF_COLOR = _BTN_COLOR
+_ACCENT_COLOR = (0.24, 0.56, 0.30, 1)
 
 
 class SettingsPanel:
-    """A collapsible panel over the pack's whole options tree, docked right."""
+    """A collapsible panel over the pack's whole options tree, docked right.
+
+    Every toggle/slider/stepper edit only updates local "pending" state —
+    the pipeline is untouched until :meth:`_commit` runs (the "Apply
+    Changes" button). :meth:`_revert` discards pending edits instead, which
+    is free (nothing was ever sent to the pipeline).
+    """
 
     def __init__(self, base, pipe, *, profiles: list[str] | None = None,
                  profile_name: str = "", on_change=None):
@@ -44,9 +61,13 @@ class SettingsPanel:
         self.pipe = pipe
         self.profiles = profiles or []
         self._profile_name = profile_name
-        self.on_change = on_change  # optional callback(), fired after any apply
+        self.on_change = on_change  # optional callback(), fired after an apply
         self._path: list[str] = []  # breadcrumb of screen names from the root
         self._rows: list[object] = []
+
+        # Staged-but-not-yet-applied edits.
+        self._pending: dict[str, object] = {}
+        self._pending_profile: str | None = None
 
         self.frame = DirectFrame(
             frameColor=(0.05, 0.05, 0.06, 0.88),
@@ -55,6 +76,16 @@ class SettingsPanel:
             state=DGG.NORMAL,
         )
         self.frame.hide()
+        self._reposition()
+        # aspect2d's horizontal extent is the window's aspect ratio, not a
+        # constant — the fixed pos=(1.02, 0, 0) above was tuned for a wide
+        # (~16:9) window. Panda3D's own default window (no size requested,
+        # which is what every example here does) is 800x600 — 4:3 — where
+        # aspect2d only reaches out to about +-1.33, so the panel's right
+        # edge (pos.x + panel half-width, ~1.77) sat almost entirely off the
+        # right edge of the screen: "wonky with scale". Re-dock on every
+        # resize instead of once at startup.
+        self.base.accept("window-event", self._on_window_event)
 
         self.title = DirectLabel(
             parent=self.frame, text="", text_scale=0.05,
@@ -63,7 +94,7 @@ class SettingsPanel:
         )
         self.hint = DirectLabel(
             parent=self.frame,
-            text="[o] close   click a category to open it   < > steps a value",
+            text="[o] close   click/drag to edit   Apply Changes to commit",
             text_scale=0.032, text_fg=_DIM_COLOR, text_align=TextNode.ALeft,
             frameColor=(0, 0, 0, 0), pos=(_PANEL_L, 0, 0.80),
         )
@@ -71,16 +102,55 @@ class SettingsPanel:
         self.scroll = DirectScrolledFrame(
             parent=self.frame,
             frameColor=(0.09, 0.09, 0.10, 1),
-            frameSize=(_PANEL_L, _PANEL_R, -0.90, 0.74),
+            frameSize=(_PANEL_L, _PANEL_R, _SCROLL_BOTTOM, _SCROLL_TOP),
             canvasSize=(_PANEL_L, _PANEL_R, -1.0, 0.0),
             scrollBarWidth=0.035,
             state=DGG.NORMAL,
         )
         self.canvas = self.scroll.getCanvas()
 
+        # Fixed apply bar — lives directly on the frame (not the scroll
+        # canvas) so it never scrolls out of view and never gets torn down
+        # by refresh()'s row rebuild.
+        self.pending_label = DirectLabel(
+            parent=self.frame, text="", text_scale=0.032,
+            text_fg=_DIM_COLOR, text_align=TextNode.ALeft,
+            frameColor=(0, 0, 0, 0), pos=(_PANEL_L, 0, -0.80),
+        )
+        self.apply_btn = DirectButton(
+            parent=self.frame, text="Apply Changes", text_scale=0.042,
+            text_fg=(1, 1, 1, 1), relief=DGG.FLAT, frameColor=_BTN_COLOR,
+            frameSize=(-0.34, 0.34, -0.028, 0.038),
+            pos=(-0.24, 0, -0.90), command=self._commit,
+        )
+        self.revert_btn = DirectButton(
+            parent=self.frame, text="Revert", text_scale=0.042,
+            text_fg=(1, 1, 1, 1), relief=DGG.FLAT, frameColor=_BTN_COLOR,
+            frameSize=(-0.16, 0.16, -0.028, 0.038),
+            pos=(0.52, 0, -0.90), command=self._revert,
+        )
+
         self.refresh()
 
     # -- visibility -----------------------------------------------------
+    def _on_window_event(self, win=None) -> None:
+        self._reposition()
+
+    def _reposition(self) -> None:
+        """Dock the panel against the right edge of the window's *actual*
+        aspect ratio instead of the fixed literal it was authored at.
+
+        Falls back to sliding the panel to hug the screen's left edge
+        instead of leaving it clipped off the right when the window is too
+        narrow to fit the whole panel (e.g. a square or portrait window).
+        """
+        aspect = self.base.getAspectRatio()
+        margin = 0.02
+        left_local, right_local = _PANEL_L - 0.03, _PANEL_R + 0.03
+        x = (aspect - margin) - right_local
+        x = max(x, (-aspect + margin) - left_local)
+        self.frame.set_x(x)
+
     def toggle(self) -> None:
         if self.frame.is_hidden():
             self.refresh()
@@ -114,37 +184,95 @@ class SettingsPanel:
             self._path.pop()
             self.refresh()
 
-    # -- applying a change --------------------------------------------------
-    def _apply(self, name: str, value: object) -> None:
-        self.pipe.set_option(name, value)
-        self.pipe.recompile()
-        if self.on_change:
-            self.on_change()
+    # -- staging edits ------------------------------------------------------
+    # Nothing below touches ``self.pipe`` — it only edits ``self._pending`` /
+    # ``self._pending_profile`` and re-renders. The pipeline is only ever
+    # touched by ``_commit``.
+    def _stage(self, name: str, value: object) -> None:
+        self._pending[name] = value
         self.refresh()
 
-    def _step_enum(self, name: str, allowed: list[str], value: object, delta: int) -> None:
+    def _stage_enum(self, name: str, allowed: list[str], value: object, delta: int) -> None:
         cur = str(value)
         idx = allowed.index(cur) if cur in allowed else 0
         idx = (idx + delta) % len(allowed)
-        self._apply(name, allowed[idx])
+        self._stage(name, allowed[idx])
+
+    @property
+    def profile_name(self) -> str:
+        """The profile currently *applied* through this panel (e.g. after
+        its own < > stepper + Apply) — lets an external caller (the demo's
+        status HUD) stay in sync without duplicating the panel's own
+        tracking. Does not reflect an unapplied pending profile pick."""
+        return self._profile_name
 
     def set_profile_name(self, name: str) -> None:
         """Keep the panel's profile row in sync with an external switch
-        (e.g. the demo's own [1][2][3] profile hotkeys)."""
+        (e.g. the demo's own [1][2][3] profile hotkeys), which applies the
+        profile immediately and resets every option to its defaults — so
+        any not-yet-applied edits made through this panel no longer apply
+        to anything and are discarded rather than silently applied later
+        on top of a baseline the user never chose."""
         self._profile_name = name
+        self._pending_profile = None
+        self._pending.clear()
         if not self.frame.is_hidden():
             self.refresh()
+        else:
+            self._sync_apply_bar()
 
-    def _step_profile(self, delta: int) -> None:
+    def _stage_profile(self, delta: int) -> None:
         if not self.profiles:
             return
-        idx = self.profiles.index(self._profile_name) if self._profile_name in self.profiles else 0
+        current = self._pending_profile if self._pending_profile is not None else self._profile_name
+        idx = self.profiles.index(current) if current in self.profiles else 0
         idx = (idx + delta) % len(self.profiles)
-        self._profile_name = self.profiles[idx]
-        self.pipe.apply_profile(self._profile_name)
+        self._pending_profile = self.profiles[idx]
+        self.refresh()
+
+    # -- committing / discarding -------------------------------------------
+    def _has_pending(self) -> bool:
+        profile_changed = (
+            self._pending_profile is not None and self._pending_profile != self._profile_name
+        )
+        return bool(self._pending) or profile_changed
+
+    def _commit(self) -> None:
+        if not self._has_pending():
+            return
+        profile_changed = self._pending_profile is not None and self._pending_profile != self._profile_name
+        if profile_changed:
+            self._profile_name = self._pending_profile
+            self.pipe.apply_profile(self._profile_name)  # applies + recompiles
+        for name, value in self._pending.items():
+            self.pipe.set_option(name, value)
+        if self._pending:
+            self.pipe.recompile()
+        self._pending.clear()
+        self._pending_profile = None
         if self.on_change:
             self.on_change()
         self.refresh()
+
+    def _revert(self) -> None:
+        if not self._has_pending():
+            return
+        self._pending.clear()
+        self._pending_profile = None
+        self.refresh()
+
+    def _sync_apply_bar(self) -> None:
+        profile_changed = self._pending_profile is not None and self._pending_profile != self._profile_name
+        total = len(self._pending) + (1 if profile_changed else 0)
+        enabled = total > 0
+        state = DGG.NORMAL if enabled else DGG.DISABLED
+        self.apply_btn["state"] = state
+        self.revert_btn["state"] = state
+        self.apply_btn["frameColor"] = _ACCENT_COLOR if enabled else _BTN_COLOR
+        if total == 0:
+            self.pending_label["text"] = "no unapplied changes"
+        else:
+            self.pending_label["text"] = f"{total} unapplied change{'s' if total != 1 else ''}"
 
     # -- rendering --------------------------------------------------------
     def refresh(self) -> None:
@@ -181,12 +309,17 @@ class SettingsPanel:
             # the dedicated profile row above already covers it.
 
         self.scroll["canvasSize"] = (_PANEL_L, _PANEL_R, y - 0.02, 0.02)
+        self._sync_apply_bar()
 
     def _row_profile(self, y: float) -> float:
+        current = self._pending_profile if self._pending_profile is not None else self._profile_name
+        dirty = self._pending_profile is not None and self._pending_profile != self._profile_name
+        label = f"profile: {current}" + (" *" if dirty else "")
         self._rows.append(_stepper_row(
-            self.canvas, y, f"profile: {self._profile_name}",
-            on_prev=lambda: self._step_profile(-1),
-            on_next=lambda: self._step_profile(1),
+            self.canvas, y, label,
+            on_prev=lambda: self._stage_profile(-1),
+            on_next=lambda: self._stage_profile(1),
+            text_fg=_MODIFIED_COLOR if dirty else _TEXT_COLOR,
         ))
         return y - _ROW_H
 
@@ -196,57 +329,114 @@ class SettingsPanel:
             parent=self.canvas, text=f"{name}  >",
             text_scale=0.045, text_fg=(1, 1, 1, 1), text_align=TextNode.ALeft,
             frameColor=_SCREEN_COLOR, relief=DGG.FLAT,
-            frameSize=(0, _PANEL_R - _PANEL_L - 0.02, -0.022, 0.032),
+            frameSize=(0, _ROW_W, -0.022, 0.032),
             pos=(_PANEL_L + 0.01, 0, y),
             command=self._enter, extraArgs=[name],
         ))
         return y - _ROW_H
 
     def _row_option(self, el: dict, y: float) -> float:
-        name, kind, value, allowed = el["name"], el["kind"], el["value"], el["allowed"]
+        name, kind, allowed = el["name"], el["kind"], el["allowed"]
+        applied = el["value"]
+        value = self._pending.get(name, applied)
+        dirty = name in self._pending
         if kind == "toggle":
-            cb = DirectCheckButton(
-                parent=self.canvas, text=name, text_scale=0.042,
-                text_fg=_TEXT_COLOR, text_align=TextNode.ALeft,
-                text_pos=(0.05, -0.014), boxPlacement="left",
-                frameColor=(0, 0, 0, 0), scale=1.0,
-                # DirectCheckButton's indicator is a DirectLabel whose own
-                # frame auto-sizes to its (' '/'*') text — without an
-                # explicit small text_scale here it defaults to a ~1-unit
-                # font size, rendering as a huge pale rectangle over
-                # everything below it instead of a small checkbox.
-                indicator_text_scale=0.05,
-                indicator_frameColor=(0.85, 0.85, 0.85, 1),
-                indicator_text_fg=(0.1, 0.1, 0.1, 1),
-                indicatorValue=bool(value),
-                pos=(_PANEL_L + _ROW_INSET, 0, y),
-                command=lambda status, name=name: self._apply(name, bool(status)),
-            )
-            self._rows.append(cb)
-        else:
-            label = name if len(allowed) <= 1 else f"{name}: {value}"
-            self._rows.append(_stepper_row(
-                self.canvas, y, label,
-                on_prev=lambda name=name, allowed=allowed, value=value:
-                    self._step_enum(name, allowed, value, -1),
-                on_next=lambda name=name, allowed=allowed, value=value:
-                    self._step_enum(name, allowed, value, 1),
-                disabled=len(allowed) <= 1,
-            ))
+            return self._row_toggle(name, bool(value), dirty, y)
+        if el.get("is_slider") and len(allowed) > 1:
+            return self._row_slider(name, allowed, value, applied, y)
+        return self._row_stepper_option(name, allowed, value, dirty, y)
+
+    def _row_toggle(self, name: str, value: bool, dirty: bool, y: float) -> float:
+        mark = "[x]" if value else "[ ]"
+        text = f"{mark} {name}" + ("  *" if dirty else "")
+        # The whole row is the hit target (frameSize spans the full row
+        # width, matching what's actually drawn) rather than a separate
+        # tiny indicator box under oversized text, so the visible button
+        # and the clickable area are the same rectangle.
+        self._rows.append(DirectButton(
+            parent=self.canvas, text=text, text_scale=0.045,
+            text_fg=(1, 1, 1, 1), text_align=TextNode.ALeft,
+            frameColor=_TOGGLE_ON_COLOR if value else _TOGGLE_OFF_COLOR,
+            relief=DGG.FLAT, frameSize=(0, _ROW_W, -0.022, 0.032),
+            pos=(_PANEL_L + 0.01, 0, y),
+            command=self._stage, extraArgs=[name, not value],
+        ))
         return y - _ROW_H
 
+    def _row_stepper_option(self, name: str, allowed: list[str], value: object,
+                             dirty: bool, y: float) -> float:
+        label = name if len(allowed) <= 1 else f"{name}: {value}"
+        if dirty:
+            label += "  *"
+        self._rows.append(_stepper_row(
+            self.canvas, y, label,
+            on_prev=lambda: self._stage_enum(name, allowed, value, -1),
+            on_next=lambda: self._stage_enum(name, allowed, value, 1),
+            disabled=len(allowed) <= 1,
+            text_fg=_MODIFIED_COLOR if dirty else _TEXT_COLOR,
+        ))
+        return y - _ROW_H
 
-def _stepper_row(parent, y, label, *, on_prev, on_next, disabled=False):
+    def _row_slider(self, name: str, allowed: list[str], value: object,
+                     applied: object, y: float) -> float:
+        dirty = str(value) != str(applied)
+        idx = allowed.index(str(value)) if str(value) in allowed else 0
+        row_h = _ROW_H * 1.5
+
+        row = DirectFrame(parent=self.canvas, frameColor=(0, 0, 0, 0),
+                           frameSize=(_PANEL_L, _PANEL_R, y - row_h + 0.03, y + 0.032),
+                           pos=(0, 0, 0))
+        label = DirectLabel(
+            parent=row, text=f"{name}: {value}" + ("  *" if dirty else ""),
+            text_scale=0.040, text_fg=_MODIFIED_COLOR if dirty else _TEXT_COLOR,
+            text_align=TextNode.ALeft, frameColor=(0, 0, 0, 0),
+            pos=(_PANEL_L + _ROW_INSET, 0, y - 0.012),
+        )
+        track_w = (_PANEL_R - _ROW_INSET) - (_PANEL_L + _ROW_INSET)
+        slider = DirectSlider(
+            parent=row, range=(0, max(len(allowed) - 1, 1)), value=idx, pageSize=1,
+            frameSize=(0, track_w, -0.010, 0.010), frameColor=(0.16, 0.16, 0.18, 1),
+            thumb_frameSize=(-0.014, 0.014, -0.022, 0.022), thumb_frameColor=_BTN_COLOR,
+            thumb_relief=DGG.FLAT,
+            pos=(_PANEL_L + _ROW_INSET, 0, y - row_h + 0.052),
+        )
+        # Dragging fires the command many times per second — rebuilding the
+        # whole row list (refresh()) on every tick would destroy this very
+        # slider mid-drag, so only this row's own label/pending state is
+        # touched here; the apply bar is cheap to keep in sync directly.
+        slider["command"] = self._on_slider_move
+        slider["extraArgs"] = [slider, label, name, allowed, applied]
+
+        self._rows.append(row)
+        return y - row_h
+
+    def _on_slider_move(self, slider, label, name: str, allowed: list[str], applied: object) -> None:
+        idx = int(round(slider["value"]))
+        idx = max(0, min(len(allowed) - 1, idx))
+        if slider["value"] != idx:
+            slider["value"] = idx  # snap to the nearest allowed step
+        value = allowed[idx]
+        if value == str(applied):
+            self._pending.pop(name, None)
+        else:
+            self._pending[name] = value
+        dirty = name in self._pending
+        label["text"] = f"{name}: {value}" + ("  *" if dirty else "")
+        label["text_fg"] = _MODIFIED_COLOR if dirty else _TEXT_COLOR
+        self._sync_apply_bar()
+
+
+def _stepper_row(parent, y, label, *, on_prev, on_next, disabled=False, text_fg=_TEXT_COLOR):
     row = DirectFrame(parent=parent, frameColor=(0, 0, 0, 0),
                        frameSize=(_PANEL_L, _PANEL_R, -0.022, 0.032), pos=(0, 0, y))
-    DirectLabel(parent=row, text=label, text_scale=0.040, text_fg=_TEXT_COLOR,
+    DirectLabel(parent=row, text=label, text_scale=0.040, text_fg=text_fg,
                 text_align=TextNode.ALeft, frameColor=(0, 0, 0, 0),
                 pos=(_PANEL_L + _ROW_INSET, 0, -0.012))
     if not disabled:
         DirectButton(parent=row, text="<", text_scale=0.04, frameColor=_BTN_COLOR,
-                     frameSize=(-0.03, 0.03, -0.018, 0.028),
+                     frameSize=(-0.045, 0.045, -0.028, 0.038),
                      pos=(_PANEL_R - 0.10, 0, -0.008), command=on_prev)
         DirectButton(parent=row, text=">", text_scale=0.04, frameColor=_BTN_COLOR,
-                     frameSize=(-0.03, 0.03, -0.018, 0.028),
+                     frameSize=(-0.045, 0.045, -0.028, 0.038),
                      pos=(_PANEL_R - 0.03, 0, -0.008), command=on_next)
     return row

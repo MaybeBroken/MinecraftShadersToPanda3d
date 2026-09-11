@@ -18,8 +18,9 @@ the tests and by examples/pipeline_describe.py.
 """
 
 import os, sys
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-  # noqa: E402 (run from a source checkout without installing)
+# noqa: E402 (run from a source checkout without installing)
 
 from direct.showbase.ShowBase import ShowBase
 from direct.actor.Actor import Actor
@@ -33,13 +34,14 @@ from _settings_panel import SettingsPanel
 
 HELP = """mcshader pipeline demo
 WASD/QE fly, arrows look, shift boost   [g] reset camera to the establishing shot
-[1][2][3] profile MINIMUM/HIGH/ULTRA
+[1][2][3][4][5] profile MINIMUM/LOW/MEDIUM/HIGH/ULTRA
 [o] live shader settings panel (every option the pack exposes, tweak + see it apply)
+[y] toggle the shader pack on/off (compare against Panda3D's own plain rendering)
 [z] toggle SHADOW option    [t] pause/resume the panda's walk
 [r] cycle the panda's render type
 [b] cycle the panda's block id
 [[ ]] step raw colortex buffers, [0] back to final
-[p] swap_pack() reload (tags survive)
+[p] swap_pack() reload (tags + profile survive)
 [k] screenshot   [h] hide/show this help"""
 
 _PROFILES = ["MINIMUM", "LOW", "MEDIUM", "HIGH", "ULTRA"]
@@ -73,6 +75,7 @@ class Demo(ShowBase):
 
         self.cam.set_pos(*_HOME_POS)
         self.cam.look_at(*_HOME_LOOK)
+        self.camLens.setFov(100)
         attach_fly_camera(self, speed=40.0)
 
         # The classic Panda3D tutorial island: real textures (ground, rock,
@@ -93,56 +96,73 @@ class Demo(ShowBase):
         self.actor.loop("walk")
         self._animating = True
 
-
-        # Load the pack and shade the whole scene through its pipeline.
-        # MINIMUM is still the lightest/cleanest profile, but HIGH/ULTRA's
-        # TAA/AO denoising (which leans on colortex2's cross-frame history)
-        # now actually converges over a few dozen frames instead of reading
-        # permanently-zero history — see README.
-        self._profile_name = "MINIMUM"
-        self.pipe = PipelineRenderer(self, pack_path, world="world0", profile=self._profile_name)
+        self._profile_name = "MEDIUM"
+        self.pipe = PipelineRenderer(
+            self, pack_path, world="world0", profile=self._profile_name
+        )
         self.sky = self.pipe.build_sky()
-        # BSL ships the sun/moon disc off by default (an Iris video-settings
-        # default, not a technical limitation) — flip it on so there's
-        # something to actually see in the sky; toggle it back off (along
-        # with everything else) via the [o] settings panel.
-        self.pipe.set_option("SHADER_SUN_MOON", True)
         self.pipe.recompile()
 
-        tag_counts = tag_by_pattern(self.pipe, self.environ, _ENV_RULES, default="terrain")
+        tag_counts = tag_by_pattern(
+            self.pipe, self.environ, _ENV_RULES, default="terrain"
+        )
 
         self._render_types = self.pipe.resolver.types()
-        self._rt_index = self._render_types.index("entity") if "entity" in self._render_types else 0
+        self._rt_index = (
+            self._render_types.index("entity") if "entity" in self._render_types else 0
+        )
         self._block_index = 0
         self.pipe.set_render_type(self.actor, self._render_types[self._rt_index])
-        tag_counts[self._render_types[self._rt_index]] = tag_counts.get(self._render_types[self._rt_index], 0) + 1
+        tag_counts[self._render_types[self._rt_index]] = (
+            tag_counts.get(self._render_types[self._rt_index], 0) + 1
+        )
         self._apply_block()
 
         self._debug_names = list(self.pipe.debug_textures().keys())
         self._debug_index = -1  # -1 == normal composited final view
         self._debug_quad = self._build_debug_quad()
+        self._pack_enabled = True
 
         # The pack's whole Iris-style options menu (every screen/toggle/
         # slider it declares), live: change a value, see it recompile and
         # apply immediately.
         self.settings = SettingsPanel(
-            self, self.pipe, profiles=_PROFILES, profile_name=self._profile_name,
-            on_change=self._on_settings_change)
+            self,
+            self.pipe,
+            profiles=_PROFILES,
+            profile_name=self._profile_name,
+            on_change=self._on_settings_change,
+        )
 
         print(self.pipe.describe())
         print("tagged by pattern:", tag_counts)
         print("\n" + HELP)
         self._help_text = OnscreenText(
-            text=HELP, pos=(-1.3, 0.95), scale=0.045, align=TextNode.ALeft,
-            fg=(1, 1, 1, 1), shadow=(0, 0, 0, 0.6), mayChange=False)
+            text=HELP,
+            pos=(-1.3, 0.95),
+            scale=0.045,
+            align=TextNode.ALeft,
+            fg=(1, 1, 1, 1),
+            shadow=(0, 0, 0, 0.6),
+            mayChange=False,
+        )
         self._status_text = OnscreenText(
-            text="", pos=(-1.3, -0.92), scale=0.05, align=TextNode.ALeft,
-            fg=(1, 1, 0.5, 1), shadow=(0, 0, 0, 0.6), mayChange=True)
+            text="",
+            pos=(-1.3, -0.92),
+            scale=0.05,
+            align=TextNode.ALeft,
+            fg=(1, 1, 0.5, 1),
+            shadow=(0, 0, 0, 0.6),
+            mayChange=True,
+        )
         self._update_status()
 
         self.accept("1", self._profile, ["MINIMUM"])
-        self.accept("2", self._profile, ["HIGH"])
-        self.accept("3", self._profile, ["ULTRA"])
+        self.accept("2", self._profile, ["LOW"])
+        self.accept("3", self._profile, ["MEDIUM"])
+        self.accept("4", self._profile, ["HIGH"])
+        self.accept("5", self._profile, ["ULTRA"])
+        self.accept("y", self._toggle_pack)
         self.accept("z", self._toggle_shadow)
         self.accept("t", self._toggle_animation)
         self.accept("r", self._cycle_render_type)
@@ -202,12 +222,10 @@ class Demo(ShowBase):
     # -- live pipeline pokes ------------------------------------------------
     def _profile(self, name):
         self._profile_name = name
+        # apply_profile() already recompiles internally — a second explicit
+        # recompile() here used to run the whole rebuild (every gbuffers/
+        # composite program, every buffer) a second time for nothing.
         self.pipe.apply_profile(name)
-        # apply_profile() resets every option to the profile's own defaults
-        # (BSL ships the sun/moon disc off) — reapply the demo's own default
-        # override, same as at startup.
-        self.pipe.set_option("SHADER_SUN_MOON", True)
-        self.pipe.recompile()
         self._debug_names = list(self.pipe.debug_textures().keys())
         if hasattr(self, "settings"):
             self.settings.set_profile_name(name)
@@ -216,14 +234,32 @@ class Demo(ShowBase):
 
     def _on_settings_change(self):
         """The settings panel just applied an option change (recompile()d
-        the pipeline) — colortex buffers are fresh objects, so the debug
-        viewer's texture references need refreshing too."""
+        the pipeline, or, via its own profile stepper, applied a whole new
+        profile) — colortex buffers are fresh objects, so the debug
+        viewer's texture references need refreshing too, and the HUD's own
+        profile label (tracked separately from the panel's) needs resyncing
+        since a profile change made *through the panel* — as opposed to the
+        [1]-[5] hotkeys — never went through `_profile()` above."""
+        self._profile_name = self.settings.profile_name
         self._debug_names = list(self.pipe.debug_textures().keys())
         if self._debug_index >= 0:
             self._cycle_debug(0)  # re-bind the currently-viewed buffer
         self._update_status()
 
+    def _toggle_pack(self):
+        self._pack_enabled = not self._pack_enabled
+        self.pipe.set_enabled(self._pack_enabled)
+        self._update_status()
+        print("shader pack ->", "on" if self._pack_enabled else "off (plain Panda3D rendering)")
+
     def _toggle_shadow(self):
+        # "SHADOW" is BSL's own toggle name, not a universal one — a pack
+        # that doesn't declare an option by that exact name (Complementary
+        # Unbound gates its shadow program on SHADOW_QUALITY instead, a
+        # numeric option, not a boolean toggle) raised a KeyError here.
+        if "SHADOW" not in self.pipe.options.options:
+            print("this pack has no 'SHADOW' option (try [o] to see its real options)")
+            return
         self.pipe.set_option("SHADOW", not self.pipe.options.get("SHADOW"))
         self.pipe.recompile()
         self._update_status()
@@ -267,13 +303,21 @@ class Demo(ShowBase):
     def _update_status(self):
         rt = self._render_types[self._rt_index]
         block = _BLOCKS[self._block_index]
-        view = self._debug_names[self._debug_index] if self._debug_index >= 0 else "final"
+        view = (
+            self._debug_names[self._debug_index] if self._debug_index >= 0 else "final"
+        )
+        shadow = (
+            self.pipe.options.get("SHADOW")
+            if "SHADOW" in self.pipe.options.options
+            else "n/a"
+        )
+        pack = "on" if self._pack_enabled else "OFF"
         self._status_text.setText(
-            f"profile={self._profile_name}  shadow={self.pipe.options.get('SHADOW')}  "
+            f"pack={pack}  profile={self._profile_name}  shadow={shadow}  "
             f"panda={rt}/{block}  view={view}"
         )
 
 
 if __name__ == "__main__":
-    pack = sys.argv[1] if len(sys.argv) > 1 else "Shaders/"
+    pack = sys.argv[1] if len(sys.argv) > 1 else "../Shaders/shaders"
     Demo(pack).run()

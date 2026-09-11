@@ -132,12 +132,19 @@ class ShaderPack:
         """Return the text of a pack file (relative to the shaders root)."""
         return self.files.get(relpath)
 
-    def properties(self):
-        """Parse ``shaders.properties`` (empty :class:`Properties` if absent)."""
+    def properties(self, values: dict[str, object] | None = None):
+        """Parse ``shaders.properties`` (empty :class:`Properties` if absent).
+
+        ``values`` (the pack's current option values) resolves any ``#if``
+        conditional blocks the file uses — see
+        :func:`mcshader.pack.properties.parse_properties`. Not cached: safe
+        (and necessary) to call again with fresh values after an option
+        changes.
+        """
         from .properties import Properties, parse_properties
 
         text = self.files.get("shaders.properties")
-        return parse_properties(text) if text is not None else Properties()
+        return parse_properties(text, values) if text is not None else Properties()
 
     def block_mapping(self):
         """Parse ``block.properties`` into a :class:`BlockMapping`."""

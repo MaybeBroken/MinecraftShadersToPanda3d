@@ -24,16 +24,198 @@ __all__ = [
     "parse_block_mapping",
     "read_raw",
     "read_pairs",
+    "eval_condition",
 ]
 
 
-def read_pairs(text: str) -> list[tuple[str, str]]:
+# -- boolean/numeric condition evaluation ---------------------------------
+# Shared by `program.*.enabled` expressions (program.py's enable_expr) AND
+# `.properties` files' own `#if`/`#else`/`#endif` preprocessor blocks below
+# — both are OptiFine/Iris expressions over the pack's own option names, just
+# used in two different places. Lives here (not pipeline/graph.py, the
+# original home) so pack/ doesn't have to depend on pipeline/ to preprocess
+# its own conditionals; pipeline/graph.py re-imports this same function.
+_COND_TOKEN = re.compile(
+    r"\s*(\(|\)|&&|\|\||==|!=|<=|>=|<|>|!|[A-Za-z_]\w*|-?\d+\.?\d*)"
+)
+
+
+def eval_condition(expr: str, values: dict[str, object]) -> bool:
+    """Evaluate an OptiFine condition: ``SHADOW && !RETRO_FILTER``,
+    ``SHADOW_QUALITY == -1``, ``(A || B) && C >= 2``.
+
+    Bare identifiers resolve to their option value truthiness (toggles use
+    their bool; numeric/string options are truthy when non-zero/non-empty;
+    unknown identifiers are treated as ``False``/``0``) — this is the whole
+    grammar `program.*.enabled` needs. Comparison operators
+    (``==``/``!=``/``<``/``>``/``<=``/``>=``) additionally let a
+    `shaders.properties` ``#if`` block gate on a numeric option's exact
+    value (e.g. Complementary's ``#if SHADOW_QUALITY == -1``), which a
+    pure-boolean grammar can't express.
+    """
+    tokens: list[str] = []
+    pos = 0
+    while pos < len(expr):
+        m = _COND_TOKEN.match(expr, pos)
+        if not m:
+            break
+        tokens.append(m.group(1))
+        pos = m.end()
+
+    def numeric(tok: str) -> float:
+        try:
+            return float(tok)
+        except ValueError:
+            pass
+        if tok not in values:
+            return 0.0
+        val = values[tok]
+        if isinstance(val, bool):
+            return 1.0 if val else 0.0
+        try:
+            return float(val)
+        except (TypeError, ValueError):
+            return 1.0 if val else 0.0  # non-numeric (e.g. enum token): truthy/falsy
+
+    # Recursive-descent: or -> and -> comparison -> unary -> atom. Every
+    # level operates on floats (0.0/1.0 for booleans) so a bare identifier
+    # and a `==`-comparison compose in the same grammar without a separate
+    # boolean/numeric type split.
+    i = 0
+
+    def parse_or() -> float:
+        nonlocal i
+        left = parse_and()
+        while i < len(tokens) and tokens[i] == "||":
+            i += 1
+            right = parse_and()
+            left = 1.0 if (left != 0.0 or right != 0.0) else 0.0
+        return left
+
+    def parse_and() -> float:
+        nonlocal i
+        left = parse_comparison()
+        while i < len(tokens) and tokens[i] == "&&":
+            i += 1
+            right = parse_comparison()
+            left = 1.0 if (left != 0.0 and right != 0.0) else 0.0
+        return left
+
+    def parse_comparison() -> float:
+        nonlocal i
+        left = parse_unary()
+        if i < len(tokens) and tokens[i] in ("==", "!=", "<", ">", "<=", ">="):
+            op = tokens[i]
+            i += 1
+            right = parse_unary()
+            result = {
+                "==": left == right, "!=": left != right,
+                "<": left < right, ">": left > right,
+                "<=": left <= right, ">=": left >= right,
+            }[op]
+            return 1.0 if result else 0.0
+        return left
+
+    def parse_unary() -> float:
+        nonlocal i
+        if i < len(tokens) and tokens[i] == "!":
+            i += 1
+            return 0.0 if parse_unary() != 0.0 else 1.0
+        return parse_atom()
+
+    def parse_atom() -> float:
+        nonlocal i
+        if i >= len(tokens):
+            return 0.0
+        tok = tokens[i]
+        if tok == "(":
+            i += 1
+            val = parse_or()
+            if i < len(tokens) and tokens[i] == ")":
+                i += 1
+            return val
+        i += 1
+        return numeric(tok)
+
+    return parse_or() != 0.0
+
+
+_IF_RE = re.compile(r"^\s*#\s*if\s+(.*?)\s*$")
+_IFDEF_RE = re.compile(r"^\s*#\s*ifdef\s+(\w+)\s*$")
+_IFNDEF_RE = re.compile(r"^\s*#\s*ifndef\s+(\w+)\s*$")
+_ELSE_RE = re.compile(r"^\s*#\s*else\b")
+_ENDIF_RE = re.compile(r"^\s*#\s*endif\b")
+
+
+def _strip_conditionals(text: str, values: dict[str, object]) -> str:
+    """Resolve ``#if``/``#ifdef``/``#ifndef``/``#else``/``#endif`` blocks in
+    a ``.properties`` file, blanking out lines in a branch not taken.
+
+    OptiFine/Iris' own `.properties` grammar supports this (Complementary
+    Unbound gates several `program.*.enabled` lines behind ``#if
+    SHADOW_QUALITY == -1``-style blocks) — every line was previously read
+    unconditionally (``#`` was treated as a plain end-of-line comment
+    marker, same as vanilla ``.properties``), which silently applied a
+    pack's *disabled-by-a-specific-option-value* overrides as if they were
+    unconditional, permanently disabling whatever they gated (confirmed:
+    this is why Complementary Unbound's shadow map never rendered — its
+    ``shadow.enabled=false`` line only applies when ``SHADOW_QUALITY==-1``,
+    not always). ``values`` should be the pack's *current* option values —
+    call sites re-resolve this on every rebuild (profile switch, settings
+    change), matching OptiFine/Iris re-evaluating it on every shader reload.
+    """
+    out: list[str] = []
+    # (branch_active, parent_active) per nesting level; a line is emitted
+    # only when every level on the stack is active.
+    stack: list[tuple[bool, bool]] = []
+
+    def active() -> bool:
+        return all(a for a, _ in stack)
+
+    for line in text.splitlines():
+        if m := _IF_RE.match(line):
+            parent = active()
+            stack.append((parent and eval_condition(m.group(1), values), parent))
+            out.append("")
+            continue
+        if m := _IFDEF_RE.match(line):
+            parent = active()
+            stack.append((parent and eval_condition(m.group(1), values), parent))
+            out.append("")
+            continue
+        if m := _IFNDEF_RE.match(line):
+            parent = active()
+            stack.append((parent and not eval_condition(m.group(1), values), parent))
+            out.append("")
+            continue
+        if _ELSE_RE.match(line):
+            if stack:
+                taken, parent = stack[-1]
+                stack[-1] = (parent and not taken, parent)
+            out.append("")
+            continue
+        if _ENDIF_RE.match(line):
+            if stack:
+                stack.pop()
+            out.append("")
+            continue
+        out.append(line if active() else "")
+    return "\n".join(out)
+
+
+def read_pairs(text: str, values: dict[str, object] | None = None) -> list[tuple[str, str]]:
     """Parse a ``.properties`` file into ``(key, value)`` pairs, in order.
 
-    Honours ``#``/``//`` comments, blank lines, and trailing ``\\`` line
-    continuations. Duplicate keys are preserved (block/item files legitimately
-    reuse a category id across several lines).
+    Honours ``#``/``//`` comments, blank lines, trailing ``\\`` line
+    continuations, and (when ``values`` is given) ``#if``/``#else``/
+    ``#endif`` conditional blocks (see :func:`_strip_conditionals`) — without
+    ``values``, unknown option identifiers default to falsy/0 in any such
+    block's condition, which is usually (not always) the pack's own default.
+    Duplicate keys are preserved (block/item files legitimately reuse a
+    category id across several lines).
     """
+    if "#if" in text or "#ifdef" in text or "#ifndef" in text:
+        text = _strip_conditionals(text, values or {})
     pairs: list[tuple[str, str]] = []
     lines = text.splitlines()
     i = 0
@@ -54,9 +236,9 @@ def read_pairs(text: str) -> list[tuple[str, str]]:
     return pairs
 
 
-def read_raw(text: str) -> dict[str, str]:
+def read_raw(text: str, values: dict[str, object] | None = None) -> dict[str, str]:
     """Parse into ``{key: value}`` (last wins for duplicate keys)."""
-    return dict(read_pairs(text))
+    return dict(read_pairs(text, values))
 
 
 @dataclass
@@ -108,9 +290,17 @@ _PROFILE_RE = re.compile(r"^profile\.(.+)$")
 _PROGRAM_EN_RE = re.compile(r"^program\.(.+)\.enabled$")
 
 
-def parse_properties(text: str) -> Properties:
-    """Parse ``shaders.properties`` text into a :class:`Properties`."""
-    raw = read_raw(text)
+def parse_properties(text: str, values: dict[str, object] | None = None) -> Properties:
+    """Parse ``shaders.properties`` text into a :class:`Properties`.
+
+    ``values`` (the pack's current option values) resolves any ``#if``/
+    ``#else``/``#endif`` blocks the file uses to conditionally set
+    `program.*.enabled`/etc — see :func:`_strip_conditionals`. Omit it (or
+    pass values from before the pack's own options were discovered) and
+    unknown identifiers in such a block default falsy/0, which usually but
+    not always matches the pack's real default.
+    """
+    raw = read_raw(text, values)
     props = Properties()
     for key, value in raw.items():
         if key == "screen":

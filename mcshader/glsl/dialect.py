@@ -76,6 +76,42 @@ _DROP_LINE = re.compile(
     r"|define\s+(attribute|varying)\b)"
 )
 
+# OptiFine/Iris let a pack declare a "custom uniform" with a fallback value
+# right in the declaration (`uniform bool heavyFog = false;`) — the game
+# feeds a real value when it recognises the name and the initializer is only
+# a default for when it doesn't. Real GLSL has no such thing for `uniform`
+# (only `const`/plain globals may be initialized), so left as-is this either
+# fails to compile under a core profile or — worse, seen on a real pack —
+# compiles anyway (some drivers accept it) but the initializer becomes the
+# identifier's only value: our own uniform recorder never sees a clean name
+# to bind, and Panda3D then asserts "shader input <name> is not present"
+# rather than silently keeping the compiled-in default. Strip the
+# initializer; every such uniform is still recorded and gets fed engine's
+# generic per-type default when no more specific value is available (see
+# PipelineRenderer._default_for) — not the same value, but the same category
+# of graceful degradation as everything else this translator can't be fully
+# faithful to.
+_UNIFORM_INIT_RE = re.compile(
+    r"^(\s*uniform\s+\w+\s+\w+(?:\s*\[\s*\d*\s*\])?)\s*=\s*[^;]+;", re.M
+)
+
+# gl_Fog is legacy fixed-function GL state (GLSL 1.10-1.20's compatibility
+# profile): no core-profile declaration exists for it, so every pack that
+# reads vanilla's fog via it (common — many packs blend with or fall back to
+# Minecraft's own fog outside their own atmospherics) fails to compile
+# outright under `#version 330`. Minecraft/OptiFine expose the same data as
+# real uniforms (`fogColor`/`fogStart`/`fogEnd`/`fogDensity`); `gl_Fog.scale`
+# has no such counterpart because real GL derives it from start/end itself.
+_GL_FOG_MEMBERS = {
+    "gl_Fog.color": ("vec4(fogColor, 1.0)", "fogColor", "uniform vec3"),
+    "gl_Fog.density": ("fogDensity", "fogDensity", "uniform float"),
+    "gl_Fog.start": ("fogStart", "fogStart", "uniform float"),
+    "gl_Fog.end": ("fogEnd", "fogEnd", "uniform float"),
+    "gl_Fog.scale": (
+        "(1.0 / max(fogEnd - fogStart, 0.0001))", None, None,
+    ),
+}
+
 
 def _word_sub(text: str, mapping: dict[str, str]) -> str:
     """Replace whole-identifier occurrences of each key with its value."""
@@ -114,6 +150,10 @@ def translate_stage(
     lines = [ln for ln in source.splitlines() if not _DROP_LINE.match(ln)]
     body = "\n".join(lines)
 
+    # 1b. Strip OptiFine/Iris "custom uniform with a fallback" initializers
+    # — see _UNIFORM_INIT_RE's docstring-style comment above.
+    body = _UNIFORM_INIT_RE.sub(r"\1;", body)
+
     # 2. Qualifier keywords: attribute/varying -> in/out by stage.
     if stage == "vertex":
         body = re.sub(r"\battribute\b", "in", body)
@@ -146,6 +186,37 @@ def translate_stage(
     # scale texture/lightmap coords, which we feed already in [0,1], so treat it
     # as identity.
     body = re.sub(r"\bgl_TextureMatrix\s*\[\s*\d+\s*\]", "mat4(1.0)", body)
+
+    # gl_Fog.* (legacy fixed-function fog state, no core-profile declaration)
+    # -> the real Minecraft uniforms it mirrors. `gl_Fog.scale` has no
+    # uniform counterpart (real GL derives it from start/end), so it becomes
+    # an expression, not a name — matching entries only add a name to
+    # `fog_names_needed` when one exists.
+    if "gl_Fog." in body:
+        # A pack that uses gl_Fog.color for its own real fogColor almost
+        # always ALSO already declares `uniform vec3 fogColor;` itself
+        # elsewhere (vanilla fog tinting is common outside gl_Fog too) —
+        # injecting a second declaration would be a redeclaration error.
+        # fogStart/fogEnd/fogDensity, by contrast, only ever existed
+        # spelled as gl_Fog.start/.end/.density, so nothing else declares
+        # them; inject those (and only those).
+        already_declared = set(re.findall(r"\buniform\s+\w+\s+(\w+)\s*;", body))
+        fog_names_needed: set[str] = set()
+        for member, (replacement, name, decl) in _GL_FOG_MEMBERS.items():
+            if member not in body:
+                continue
+            body = body.replace(member, replacement)
+            if name and name not in already_declared:
+                fog_names_needed.add((name, decl))
+        # gl_Fog.scale expands to an expression referencing fogEnd/fogStart
+        # directly (not through _GL_FOG_MEMBERS' own name/decl slot), so it
+        # needs them declared too even when neither was used on its own.
+        if "fogEnd - fogStart" in body:
+            for name, decl in (("fogStart", "uniform float"), ("fogEnd", "uniform float")):
+                if name not in already_declared:
+                    fog_names_needed.add((name, decl))
+        for name, decl in fog_names_needed:
+            introduced.append((name, decl))
 
     # gl_MultiTexCoord0 is a vec4 in Minecraft; Panda3D provides a vec2 texcoord,
     # so promote every use to vec4 (and keep the vec2 attribute). gl_MultiTexCoord1

@@ -23,7 +23,21 @@ def test_resolve_includes_keeps_unresolvable():
 def test_resolve_includes_breaks_cycles():
     files = {"a": '#include "b"', "b": '#include "a"'}
     out = resolve_includes('#include "a"', files=files)
-    assert "cyclic" in out
+    assert "skipped already-included file" in out
+
+
+def test_resolve_includes_dedupes_diamond_dependency():
+    # b and c both include the shared lib "d" -- a naive resolver would
+    # expand "d" twice; real Iris `#include` (and this resolver) expands each
+    # file at most once per compiled program.
+    files = {
+        "a": '#include "b"\n#include "c"',
+        "b": '#include "d"',
+        "c": '#include "d"',
+        "d": "D_CONTENT",
+    }
+    out = resolve_includes('#include "a"', files=files)
+    assert out.count("D_CONTENT") == 1
 
 
 def test_select_stage_keeps_shared_drops_other():

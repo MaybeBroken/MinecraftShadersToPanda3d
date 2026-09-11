@@ -69,9 +69,12 @@ class PipelineRenderer:
         self.target = target
         self._geometry: list[tuple[Any, str]] = []  # (nodepath, render_type)
         self._quads: list[Any] = []
+        self._final_quads: list[Any] = []  # subset of _quads that cover the window
         self._colortex: dict[int, Any] = {}
         self._colortex_back: dict[int, Any] = {}
         self._task_started = False
+        self._enabled = True  # see set_enabled() -- pack-shaded vs. plain rendering
+        self.profile_name: str | None = None
         self.load_pack(pack_path, world=world, profile=profile)
 
     # -- pack / options lifecycle ---------------------------------------
@@ -80,24 +83,47 @@ class PipelineRenderer:
         """Load (or reload) a shaderpack and rebuild everything."""
         self.pack = ShaderPack.from_path(pack_path)
         self.world = world or self.world
+        # Bootstrap parse: no option values exist yet, so any `#if` block in
+        # shaders.properties resolves with unknown identifiers defaulting
+        # falsy/0 (see pack.properties.parse_properties) — fine here, this
+        # first Properties is only used to discover option/profile/menu
+        # names, never `program.*.enabled` (build_graph re-parses with real
+        # values below, before it's ever consulted).
         self.props = self.pack.properties()
         self.options = ShaderOptions.from_pack(self.pack.option_sources(), self.props)
         if profile:
             self.options.apply_profile(profile, self.props)
-        self.graph: PipelineGraph = build_graph(self.pack, self.world)
+        self.profile_name = profile
+        # Re-parse now that real option values exist, so `#if` blocks around
+        # `program.*.enabled` (confirmed real: Complementary Unbound gates
+        # its shadow program behind `#if SHADOW_QUALITY == -1`) resolve
+        # against this pack's actual defaults/profile, not the bootstrap
+        # all-falsy guess.
+        self.props = self.pack.properties(self.options.values())
+        self.graph: PipelineGraph = build_graph(self.pack, self.world, self.options.values())
         self.resolver = RenderTypeResolver(self.pack)
         self._build()
 
     def swap_pack(self, pack_path: str) -> None:
-        """Re-shade the whole scene with a different pack, keeping tags."""
+        """Re-shade the whole scene with a different pack, keeping tags and
+        the currently active profile.
+
+        Previously called ``load_pack(pack_path)`` with no ``profile``,
+        which silently reset every option to the *new* pack's raw defaults
+        regardless of what profile (e.g. ULTRA) was active before the
+        swap — "tags survive" was true, but the profile selection quietly
+        wasn't, with nothing in the GUI reflecting the reset.
+        """
         tags = list(self._geometry)
+        profile = self.profile_name
         self._teardown()
-        self.load_pack(pack_path)
+        self.load_pack(pack_path, profile=profile)
         for nodepath, render_type in tags:
             self.set_render_type(nodepath, render_type)
 
     def apply_profile(self, name: str) -> None:
         self.options.apply_profile(name, self.props)
+        self.profile_name = name
         self.recompile()
 
     def set_option(self, name: str, value: object) -> None:
@@ -107,7 +133,13 @@ class PipelineRenderer:
         """Rebuild shaders/passes after option changes."""
         tags = list(self._geometry)
         self._teardown()
-        self.graph = build_graph(self.pack, self.world)
+        # Re-parse shaders.properties with the *current* option values too —
+        # not just build_graph's own program_enabled resolution — so a live
+        # option change (profile switch, settings-panel edit) that flips a
+        # `#if`-gated program.*.enabled block re-resolves the same way
+        # OptiFine/Iris does on every shader reload.
+        self.props = self.pack.properties(self.options.values())
+        self.graph = build_graph(self.pack, self.world, self.options.values())
         self._build()
         for nodepath, render_type in tags:
             self.set_render_type(nodepath, render_type)
@@ -121,11 +153,42 @@ class PipelineRenderer:
                 f"pack {self.pack.name!r} has no program for render type "
                 f"{render_type!r}; available: {self.resolver.types()}"
             )
-        shader = self._compiled_geometry.get(program)
-        if shader is not None:
-            nodepath.set_shader(shader)
         nodepath.set_shader_input("mcEntityId", 0)
         self._geometry.append((nodepath, render_type))
+        # Respect a standing set_enabled(False): re-tagging (a rebuild after
+        # an option change, a swap_pack() replay) must not silently re-shade
+        # geometry the caller explicitly turned the pack off for.
+        if self._enabled:
+            shader = self._compiled_geometry.get(program)
+            if shader is not None:
+                nodepath.set_shader(shader)
+        else:
+            nodepath.clear_shader()
+
+    def set_enabled(self, enabled: bool) -> None:
+        """Toggle between the pack's full shaded pipeline and Panda3D's own
+        plain (unshaded) rendering of the same tagged scene — without
+        reloading the pack or losing render-type tags, so you can A/B the
+        shading against vanilla geometry.
+
+        The offscreen gbuffer/composite chain keeps running underneath
+        either way (cheap to leave alone); only the final composited
+        quad(s) are hidden so the window falls through to Panda's own
+        default display region — which renders the same scene graph, so
+        clearing every tagged NodePath's shader is what actually changes
+        its look there.
+        """
+        self._enabled = enabled
+        for quad in self._final_quads:
+            (quad.show if enabled else quad.hide)()
+        for nodepath, render_type in self._geometry:
+            if enabled:
+                program = self.resolver.program(render_type)
+                shader = self._compiled_geometry.get(program)
+                if shader is not None:
+                    nodepath.set_shader(shader)
+            else:
+                nodepath.clear_shader()
 
     def set_block_id(self, nodepath: Any, block_id: int) -> None:
         """Feed the block id a gbuffers shader keys waving/material off of.
@@ -243,6 +306,7 @@ class PipelineRenderer:
                 pass
             self._shadow_cam = None
         self._quads.clear()
+        self._final_quads.clear()
         self._colortex.clear()
         self._colortex_back.clear()
         self._buffers = []
@@ -507,11 +571,41 @@ class PipelineRenderer:
         m.set_row(3, LVecBase4(0, 0, 0, 1))
         return m
 
+    @staticmethod
+    def _safe_up(view_direction: Any) -> Any:
+        """A Z-up-preferring ``up`` hint for ``look_at()`` that falls back to
+        a perpendicular axis when ``view_direction`` is nearly parallel to
+        the default up vector ``(0, 0, 1)``.
+
+        ``look_at()`` with no explicit ``up`` builds its basis from
+        ``cross(up, forward)``; as ``forward`` approaches parallel to
+        ``(0, 0, 1)`` that cross product shrinks toward zero and the
+        resulting orientation's *roll* becomes numerically unstable —
+        hypersensitive to the exact input values (including tiny
+        floating-point differences), not just genuinely undefined at the
+        limit. The shadow camera looks down the sun direction, which is
+        close to vertical for a large fraction of every simulated day (not
+        an edge case near noon) — a plausible root cause for shadows
+        reported as "wrongly shaped/huge" and appearing to reorient with
+        camera movement despite the view direction itself only depending on
+        the (slowly-changing) sun angle.
+        """
+        from panda3d.core import LVecBase3
+
+        d = LVecBase3(view_direction)
+        if d.length_squared() < 1e-12:
+            return LVecBase3(0, 0, 1)
+        d.normalize()
+        if abs(d.dot(LVecBase3(0, 0, 1))) > 0.95:
+            return LVecBase3(0, 1, 0)
+        return LVecBase3(0, 0, 1)
+
     def _build_shadow_pass(self) -> None:
         from panda3d.core import (Camera, OrthographicLens, NodePath, GraphicsOutput,
                                   FrameBufferProperties, GraphicsPipe, WindowProperties)
 
-        if self._compile("shadow", mode="gbuffer") is None:
+        shadow_shader = self._compile("shadow", mode="gbuffer")
+        if shadow_shader is None:
             self._shadow_buf = None
             self._shadow_tex = None
             self._shadow_cam = None
@@ -562,11 +656,16 @@ class PipelineRenderer:
         lens.set_film_size(dist, dist)
         lens.set_near_far(1.0, dist * 2.0)
         cam = Camera("mcshader-shadow-cam", lens)
-        shadow_shader = self._compile("shadow")
-        if shadow_shader is not None:
-            from panda3d.core import ShaderAttrib, RenderState
-            cam.set_initial_state(
-                RenderState.make(ShaderAttrib.make(shadow_shader)))
+        # Reuse the same "gbuffer"-mode shader checked for existence above —
+        # this used to call self._compile("shadow") again with no mode
+        # argument (silently defaulting to "compact", the fullscreen-quad
+        # output-numbering scheme), recompiling the *same* program a second
+        # time with the *wrong* mode for real scene geometry. Harmless for
+        # BSL (whose shadow.glsl only ever writes gl_FragData[0], where both
+        # modes number identically) but not general, and wasteful either way.
+        from panda3d.core import ShaderAttrib, RenderState
+        cam.set_initial_state(
+            RenderState.make(ShaderAttrib.make(shadow_shader)))
         self._shadow_cam = self.base.render.attach_new_node(cam)
         # Point the shadow camera down the sun direction, centred on the
         # PLAYER (base.cam), not the world origin. Minecraft's own shadow
@@ -591,7 +690,7 @@ class PipelineRenderer:
         _, cs_yup_to_zup = self._cs_conversion()
         sun_panda = cs_yup_to_zup.xform_vec(self._sun_direction())
         self._shadow_cam.set_pos(center + sun_panda * (dist * 0.5))
-        self._shadow_cam.look_at(center)
+        self._shadow_cam.look_at(center, self._safe_up(-sun_panda))
         dr = self._shadow_buf.make_display_region()
         dr.set_camera(self._shadow_cam)
 
@@ -655,6 +754,10 @@ class PipelineRenderer:
             hazards = self._self_read_outputs(tp)
             self._render_quad(quad, p, is_final=is_final, order=i, hazards=hazards)
             self._quads.append(quad)
+            if is_final:
+                self._final_quads.append(quad)
+                if not self._enabled:  # a rebuild while pack is toggled off
+                    quad.hide()
 
     def _render_quad(self, quad: Any, p: Any, *, is_final: bool, order: int,
                      hazards: frozenset[int] | set[int] = frozenset()) -> None:
@@ -883,11 +986,25 @@ class PipelineRenderer:
 
         cs_zup_to_yup, cs_yup_to_zup = self._cs_conversion()
 
-        # gbufferModelView/Inverse: Minecraft-Y-up-world(relative to the
-        # PLAYER camera) <-> the real, native Panda camera-local space —
-        # see `_cs_conversion`/`_rotation_only` for why this is a pure
-        # rotation (no translation: BSL's own gbufferModelView carries none
-        # either, since Minecraft's vertex data is already camera-relative).
+        # gbufferModelView/Inverse: OpenGL-standard view space (X-right,
+        # Y-up, Z-backward — the space every BSL shader's own math assumes
+        # its "view space" to be in) <-> Minecraft-Y-up world (relative to
+        # the PLAYER camera). This is a *three*-matrix rotation, not two:
+        # `cs_yup_to_zup` first relabels the OpenGL-view-space input back
+        # into Panda's native camera-local axes (X-right, Y-forward, Z-up —
+        # what Panda's own camera actually looks down), THEN `rot_player`
+        # carries it into native Panda world space, THEN `cs_zup_to_yup`
+        # relabels that into Minecraft's Y-up world. Dropping the first
+        # term (an earlier version of this code did) leaves the *shape* of
+        # gbufferModelView looking plausible — it's still a pure rotation,
+        # still self-cancels with its own inverse — but silently mismatches
+        # gbufferProjection, whose diagonal-shortcut consumers assume the
+        # standard convention (see the `proj` comment below): confirmed by
+        # reconstructing Panda's own CS_yup_right-lens projection matrix
+        # numerically as `cs_yup_to_zup * <Panda's native projection>` and
+        # checking it against Panda's own output with that coordinate
+        # system set — they match exactly.
+        #
         # Built as a true inverse pair (gbuffer_mv is the *numeric* inverse
         # of gbuffer_mv_inv) so every self-cancelling
         # `gbufferModelView * gbufferModelViewInverse * ...` chain BSL's own
@@ -896,11 +1013,29 @@ class PipelineRenderer:
         # semantics — real rendered geometry position is provably unaffected
         # by this reconciliation, only the shaders' own world-space math is.
         rot_player = self._rotation_only(cam_np.get_mat(render))  # player-view -> world
-        gbuffer_mv_inv = rot_player * cs_zup_to_yup
+        gbuffer_mv_inv = cs_yup_to_zup * rot_player * cs_zup_to_yup
         gbuffer_mv = LMatrix4(gbuffer_mv_inv)
         gbuffer_mv.invert_in_place()
 
-        proj = LMatrix4(lens.get_projection_mat())
+        # gbufferProjection must be in the *standard* OpenGL projection
+        # matrix convention, not Panda's native one. This isn't just about
+        # axis orientation for full `proj * modelview * v` chains (those
+        # would tolerate any consistent convention) — a lot of BSL's own
+        # code (`ToNDC`/`ToShadow`'s `projMAD`/`diagonal3` macros in
+        # spaceConversion.glsl, `GetLinearDepth` used throughout AO/light
+        # shafts/outline/bloom) reads specific *cells* of this matrix
+        # assuming the sparse layout of a standard symmetric-frustum
+        # projection (`m[0].x`/`m[1].y`/`m[2].zw`/`m[3]`). Panda's native
+        # `lens.get_projection_mat()` is mathematically a valid projection
+        # but puts those same terms in *different* cells (its camera-local
+        # convention is X-right/Y-forward/Z-up, not X-right/Y-up/
+        # Z-backward) — those shortcuts silently read zeros/garbage instead
+        # of the real depth/aspect terms. This was the root cause behind
+        # screen-space effects (AO, light shafts, SSR, bloom, DOF) and
+        # shadow-space reconstruction (`ToShadow`, see `shadowProjection`
+        # below) all being visibly broken despite the shadow map and gbuffer
+        # geometry themselves rendering correctly.
+        proj = cs_yup_to_zup * LMatrix4(lens.get_projection_mat())
         proj_inv = LMatrix4(proj); proj_inv.invert_in_place()
 
         camera_position_mc = cs_zup_to_yup.xform_point(cam_pos)
@@ -921,9 +1056,18 @@ class PipelineRenderer:
             dist = getattr(self, "_shadow_dist", 256.0)
             sun_panda = cs_yup_to_zup.xform_vec(sun_mc)
             shadow_cam_np.set_pos(cam_pos + sun_panda * (dist * 0.5))
-            shadow_cam_np.look_at(cam_pos)
+            shadow_cam_np.look_at(cam_pos, self._safe_up(-sun_panda))
 
-            s_proj = LMatrix4(shadow_cam_np.node().get_lens().get_projection_mat())
+            # Same standard-convention fix as `proj` above — confirmed the
+            # identical relabeling (`cs_yup_to_zup * <native>`) reproduces
+            # Panda's own CS_yup_right output for OrthographicLens too, not
+            # just PerspectiveLens. `ToShadow` (spaceConversion.glsl) uses
+            # the same `projMAD`/`diagonal3` cell-shortcut on
+            # shadowProjection that `ToNDC` uses on gbufferProjection — this
+            # was the actual cause of `GetShadow()` reading a garbage
+            # reference depth (see shadows.glsl), not a bias/acne issue as
+            # previously suspected.
+            s_proj = cs_yup_to_zup * LMatrix4(shadow_cam_np.node().get_lens().get_projection_mat())
             s_proj_inv = LMatrix4(s_proj); s_proj_inv.invert_in_place()
 
             # Same rotation-only reconciliation as gbufferModelView, but the
@@ -944,22 +1088,46 @@ class PipelineRenderer:
             # caustics) depends on getting the offset right.
             rot_shadow = self._rotation_only(shadow_cam_np.get_mat(render))
             offset = cs_zup_to_yup.xform_vec(shadow_cam_np.get_pos(render) - cam_pos)
-            s_mv_inv = rot_shadow * cs_zup_to_yup * LMatrix4.translate_mat(offset)
+            s_mv_inv = cs_yup_to_zup * rot_shadow * cs_zup_to_yup * LMatrix4.translate_mat(offset)
             s_mv = LMatrix4(s_mv_inv)
             s_mv.invert_in_place()
         else:
             s_mv, s_mv_inv, s_proj, s_proj_inv = gbuffer_mv, gbuffer_mv_inv, proj, proj_inv
+
+        # gbufferPreviousModelView/Projection and previousCameraPosition must
+        # be genuinely LAST frame's values, not a copy of this frame's — TAA
+        # (taa.glsl's Reprojection) unprojects the current pixel with the
+        # *current* inverse matrices, offsets by `cameraPosition -
+        # previousCameraPosition`, then reprojects with the *previous*
+        # forward matrices to find where that same world point was on
+        # screen last frame. Feeding identical current/previous matrices
+        # (as this did before) makes `cameraOffset` permanently zero and
+        # the reprojection a no-op — every reprojected sample lands back at
+        # the *current* screen position regardless of real camera motion,
+        # so TAA blends the new frame with a history texel that (whenever
+        # the camera actually moved) represents a different world point.
+        # That mismatch is exactly what reads as persistent speckle/noise
+        # ("staticy") under camera motion, on top of AO leaning on the same
+        # history buffer. Cached on `self` and updated at the end of every
+        # call, one frame behind on purpose.
+        prev_gbuffer_mv = getattr(self, "_prev_gbuffer_mv", gbuffer_mv)
+        prev_proj = getattr(self, "_prev_proj", proj)
+        prev_camera_position_mc = getattr(self, "_prev_camera_position_mc", camera_position_mc)
+        self._prev_gbuffer_mv = gbuffer_mv
+        self._prev_proj = proj
+        self._prev_camera_position_mc = camera_position_mc
+
         return {
             "frameTimeCounter": t, "frameTime": clock.get_dt(),
             "frameCounter": frame_count,
             "viewWidth": w, "viewHeight": h, "aspectRatio": w / max(h, 1.0),
             "near": lens.get_near(), "far": lens.get_far(),
             **day, "rainStrength": 0.0, "wetness": 0.0,
-            "cameraPosition": camera_position_mc, "previousCameraPosition": camera_position_mc,
+            "cameraPosition": camera_position_mc, "previousCameraPosition": prev_camera_position_mc,
             "gbufferModelView": gbuffer_mv, "gbufferModelViewInverse": gbuffer_mv_inv,
-            "gbufferPreviousModelView": gbuffer_mv,
+            "gbufferPreviousModelView": prev_gbuffer_mv,
             "gbufferProjection": proj, "gbufferProjectionInverse": proj_inv,
-            "gbufferPreviousProjection": proj,
+            "gbufferPreviousProjection": prev_proj,
             "shadowModelView": s_mv, "shadowModelViewInverse": s_mv_inv,
             "shadowProjection": s_proj, "shadowProjectionInverse": s_proj_inv,
             "sunPosition": sun_view, "moonPosition": sun_view * -1.0,
@@ -989,6 +1157,27 @@ class PipelineRenderer:
             "mat3": LMatrix3.ident_mat(), "mat4": LMatrix4.ident_mat(),
         }.get(gtype, 0.0)
 
+    #: GLSL scalar types whose Panda3D shader input must be a Python `int`
+    #: (or bool) — the values this class *computes* (`_dynamic_uniforms`/
+    #: `_day_cycle_uniforms`) are written assuming BSL's own declared types
+    #: (e.g. `worldTime` as a `float`), but Minecraft's real convention (and
+    #: what other packs — Complementary confirmed — actually declare) is
+    #: `int`. Panda3D's `set_shader_input` doesn't coerce for you: feeding a
+    #: Python `float` to a shader's `int`/`uint` uniform is a hard GL error
+    #: ("Cannot pass floating-point data to integer shader input"), not a
+    #: silent truncation, so a pack that declares a *different* type than
+    #: BSL for the same semantic uniform previously broke outright.
+    _INT_GLSL_TYPES = frozenset({"int", "uint", "bool"})
+
+    def _coerce(self, value: Any, gtype: str) -> Any:
+        """Adapt a computed value to whatever GLSL type *this pack* declared
+        the uniform as, rather than assuming BSL's own declared type."""
+        if gtype in self._INT_GLSL_TYPES and isinstance(value, (int, float, bool)):
+            return int(round(value))
+        if gtype == "float" and isinstance(value, (int, bool)):
+            return float(value)
+        return value
+
     def _update(self, task: Any) -> Any:
         from direct.task import Task
 
@@ -1005,7 +1194,7 @@ class PipelineRenderer:
                     value = self._NAMED_DEFAULTS.get(name)
                 if value is None:
                     value = self._default_for(gtype)
-                node.set_shader_input(name, value)
+                node.set_shader_input(name, self._coerce(value, gtype))
         return Task.cont
 
     # -- inspection (headless) ------------------------------------------

@@ -19,6 +19,7 @@ import re
 from dataclasses import dataclass, field
 
 from ..pack.loader import ShaderPack
+from ..pack.properties import eval_condition
 from ..glsl import preprocess
 
 __all__ = [
@@ -143,10 +144,20 @@ def _outputs_of(pack: ShaderPack, name: str, world: str) -> list[int]:
     return sorted(found)
 
 
-def build_graph(pack: ShaderPack, world: str = "world0") -> PipelineGraph:
-    """Construct the ordered pass list and buffer pool for ``world``."""
+def build_graph(pack: ShaderPack, world: str = "world0",
+                 values: dict[str, object] | None = None) -> PipelineGraph:
+    """Construct the ordered pass list and buffer pool for ``world``.
+
+    ``values`` (the pack's *current* option values) resolves any ``#if``
+    blocks `shaders.properties` uses around `program.*.enabled` lines (see
+    ``pack.properties.parse_properties``) — omit it only for a pack known not
+    to use them; a caller rebuilding the graph after an option change should
+    always pass the current values so conditionally-enabled programs track
+    the live option state, the same way OptiFine/Iris re-resolves them on
+    every shader reload.
+    """
     existing = set(pack.programs())
-    props = pack.properties()
+    props = pack.properties(values)
 
     # Buffer pool: scan every program's sources for format/clear declarations.
     buffers = BufferSet()
@@ -193,77 +204,3 @@ def build_graph(pack: ShaderPack, world: str = "world0") -> PipelineGraph:
             buffers.formats.setdefault(idx, "RGBA16")
 
     return PipelineGraph(world=world, passes=passes, buffers=buffers)
-
-
-# -- boolean condition evaluation (program.*.enabled expressions) --------
-_TOKEN = re.compile(r"\s*(\(|\)|&&|\|\||!|[A-Za-z_]\w*|-?\d+\.?\d*)")
-
-
-def eval_condition(expr: str, values: dict[str, object]) -> bool:
-    """Evaluate an OptiFine enable expression like ``SHADOW && !RETRO_FILTER``.
-
-    Identifiers resolve to option values: toggles use their bool; numeric
-    options are truthy when non-zero; unknown identifiers are treated as False.
-    """
-    tokens: list[str] = []
-    pos = 0
-    while pos < len(expr):
-        m = _TOKEN.match(expr, pos)
-        if not m:
-            break
-        tokens.append(m.group(1))
-        pos = m.end()
-
-    def resolve(name: str) -> bool:
-        if name not in values:
-            return False
-        val = values[name]
-        if isinstance(val, bool):
-            return val
-        try:
-            return float(val) != 0.0
-        except (TypeError, ValueError):
-            return bool(val)
-
-    # Recursive-descent: or -> and -> unary -> atom.
-    i = 0
-
-    def parse_or():
-        nonlocal i
-        left = parse_and()
-        while i < len(tokens) and tokens[i] == "||":
-            i += 1
-            left = parse_and() or left
-        return left
-
-    def parse_and():
-        nonlocal i
-        left = parse_unary()
-        while i < len(tokens) and tokens[i] == "&&":
-            i += 1
-            right = parse_unary()
-            left = left and right
-        return left
-
-    def parse_unary():
-        nonlocal i
-        if i < len(tokens) and tokens[i] == "!":
-            i += 1
-            return not parse_unary()
-        return parse_atom()
-
-    def parse_atom():
-        nonlocal i
-        if i >= len(tokens):
-            return False
-        tok = tokens[i]
-        if tok == "(":
-            i += 1
-            val = parse_or()
-            if i < len(tokens) and tokens[i] == ")":
-                i += 1
-            return val
-        i += 1
-        return resolve(tok)
-
-    return bool(parse_or())
