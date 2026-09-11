@@ -22,12 +22,20 @@ machinery, and nothing here touches shader source directly.
 from __future__ import annotations
 
 from direct.gui.DirectGui import (
-    DGG, DirectButton, DirectFrame, DirectLabel, DirectScrolledFrame,
-    DirectSlider,
+    DGG, DirectButton, DirectEntry, DirectFrame, DirectLabel,
+    DirectScrolledFrame, DirectSlider,
 )
-from panda3d.core import TextNode
+from panda3d.core import PGTop, TextNode
 
 __all__ = ["SettingsPanel"]
+
+# All the frameSize/pos constants below are authored in a fixed local unit
+# system, not window-relative aspect2d units — see _reposition() for how
+# that's turned into a constant on-screen pixel size. _SCALE=300 was chosen
+# to match this panel's original look on a plain 800x600 window.
+_SCALE = 300
+_MARGIN_NDC = 0.02  # small gap from the true screen edge, as a fraction of
+                    # render2d's -1..1 span (~8px on an 800px-wide window)
 
 _ROW_H = 0.062
 _PANEL_L, _PANEL_R = -0.68, 0.72
@@ -69,22 +77,35 @@ class SettingsPanel:
         self._pending: dict[str, object] = {}
         self._pending_profile: str | None = None
 
+        # DirectGui (the "PG" system) needs to be rooted under a PGTop node
+        # to render/pick correctly — aspect2d and pixel2d are each one, and
+        # parenting straight under a plain render2d node (no PGTop) instead
+        # produces broken rendering (observed: DirectScrolledFrame's clip
+        # region collapsing, and the whole window going solid magenta with
+        # this panel's full widget tree) even though a lone DirectFrame can
+        # look fine there. So: make our own PGTop, attached directly to
+        # render2d — whose -1..1 span is *always* exactly the full window
+        # on any platform/DPI, with zero recomputation ever needed, unlike
+        # aspect2d, which rescales its whole coordinate space to compensate
+        # for the window's aspect ratio (correct for the 3D scene, but
+        # meant this panel would only ever look "right" at the aspect
+        # ratio it happened to be authored/launched at) — and hook it up to
+        # the same MouseWatcher aspect2d/pixel2d use, or clicks/drags on
+        # this panel's buttons/sliders/entries would never register.
+        self._pg_root = self.base.render2d.attachNewNode(PGTop("settings-panel"))
+        self._pg_root.node().setMouseWatcher(self.base.mouseWatcherNode)
+
+        # pos/scale are both set by _reposition() below (not fixed here) —
+        # see that method for why.
         self.frame = DirectFrame(
+            parent=self._pg_root,
             frameColor=(0.05, 0.05, 0.06, 0.88),
             frameSize=(_PANEL_L - 0.03, _PANEL_R + 0.03, -0.95, 0.95),
-            pos=(1.02, 0, 0),
             state=DGG.NORMAL,
         )
         self.frame.hide()
         self._reposition()
-        # aspect2d's horizontal extent is the window's aspect ratio, not a
-        # constant — the fixed pos=(1.02, 0, 0) above was tuned for a wide
-        # (~16:9) window. Panda3D's own default window (no size requested,
-        # which is what every example here does) is 800x600 — 4:3 — where
-        # aspect2d only reaches out to about +-1.33, so the panel's right
-        # edge (pos.x + panel half-width, ~1.77) sat almost entirely off the
-        # right edge of the screen: "wonky with scale". Re-dock on every
-        # resize instead of once at startup.
+        # Re-dock/re-scale on every resize instead of once at startup.
         self.base.accept("window-event", self._on_window_event)
 
         self.title = DirectLabel(
@@ -137,19 +158,57 @@ class SettingsPanel:
         self._reposition()
 
     def _reposition(self) -> None:
-        """Dock the panel against the right edge of the window's *actual*
-        aspect ratio instead of the fixed literal it was authored at.
+        """Pin the panel's top-right corner to the screen's actual
+        top-right corner, and give it a fixed real-pixel size — using
+        render2d's native NDC space (always exactly -1..1 across the full
+        window, on any platform/DPI, with zero recomputation needed) as the
+        position reference, rather than an independently-read pixel count.
 
-        Falls back to sliding the panel to hug the screen's left edge
-        instead of leaving it clipped off the right when the window is too
-        narrow to fit the whole panel (e.g. a square or portrait window).
+        The key property: position is written as a function of the *same*
+        scale factor (sx/sz) used for sizing, so the docked corner stays
+        exactly glued to the screen edge even if that factor is ever wrong
+        for some reason (a platform DPI/window-scaling quirk, a resize
+        event carrying a stale size, ...). A previous version derived
+        scale (fixed once at construction) and position (re-read
+        independently on every resize) from two separately-sourced pixel
+        counts; any disagreement between them was directly visible as the
+        panel drifting away from its corner during a live resize — moving
+        at some multiple of the correct rate — until it slid off-screen.
+        Here, expanding the algebra shows the corner is invariant no matter
+        what sx/sz numerically are:
+
+            right_edge = pos.x + right_local * sx
+                       = ((1 - margin) - right_local * sx) + right_local * sx
+                       = 1 - margin                                  (constant)
+
+        so a wrong sx/sz can at most make the panel too big/small — it can
+        no longer make it wander from the corner.
         """
-        aspect = self.base.getAspectRatio()
-        margin = 0.02
-        left_local, right_local = _PANEL_L - 0.03, _PANEL_R + 0.03
-        x = (aspect - margin) - right_local
-        x = max(x, (-aspect + margin) - left_local)
-        self.frame.set_x(x)
+        win = self.base.win
+        if win is None or not win.hasSize():
+            return
+        w, h = win.getXSize(), win.getYSize()
+        # Right after the window is created (before the window manager has
+        # actually mapped/sized it), this can briefly be zero/invalid —
+        # computing a dock position from that sends the panel off-screen,
+        # and since nothing re-triggers _reposition() until the *next* real
+        # resize, it can stay stranded there indefinitely if the user never
+        # resizes the window. Refusing to move on a nonsensical size,
+        # combined with refresh() re-calling this every time the panel is
+        # actually shown (by which point the window has always finished
+        # initializing), is what actually provides "wait until it's ready".
+        if w <= 0 or h <= 0:
+            return
+        sx, sz = _SCALE * 2.0 / w, _SCALE * 2.0 / h
+        left_local, right_local, top_local = _PANEL_L - 0.03, _PANEL_R + 0.03, 0.95
+        x = (1 - _MARGIN_NDC) - right_local * sx
+        # Narrow-window fallback: hug the left edge instead of leaving the
+        # panel clipped off the right when it doesn't fit (e.g. a square or
+        # portrait window) — same idea as before, adapted to this formula.
+        x = max(x, (-1 + _MARGIN_NDC) - left_local * sx)
+        z = (1 - _MARGIN_NDC) - top_local * sz
+        self.frame.setPos(x, 0, z)
+        self.frame.setScale(sx, 1, sz)
 
     def toggle(self) -> None:
         if self.frame.is_hidden():
@@ -276,6 +335,13 @@ class SettingsPanel:
 
     # -- rendering --------------------------------------------------------
     def refresh(self) -> None:
+        # Re-dock on every refresh (i.e. every show()/toggle()-open), not
+        # just once at construction — by the time the panel is actually
+        # shown the window is guaranteed to be fully initialized, so this
+        # is what makes the panel self-correct even if the very first
+        # _reposition() (in __init__) ran before the window was ready.
+        self._reposition()
+
         for row in self._rows:
             row.destroy()
         self._rows.clear()
@@ -342,9 +408,10 @@ class SettingsPanel:
         dirty = name in self._pending
         if kind == "toggle":
             return self._row_toggle(name, bool(value), dirty, y)
+        numeric = _is_numeric(applied)
         if el.get("is_slider") and len(allowed) > 1:
             return self._row_slider(name, allowed, value, applied, y)
-        return self._row_stepper_option(name, allowed, value, dirty, y)
+        return self._row_stepper_option(name, allowed, value, applied, dirty, numeric, y)
 
     def _row_toggle(self, name: str, value: bool, dirty: bool, y: float) -> float:
         mark = "[x]" if value else "[ ]"
@@ -363,8 +430,16 @@ class SettingsPanel:
         ))
         return y - _ROW_H
 
-    def _row_stepper_option(self, name: str, allowed: list[str], value: object,
-                             dirty: bool, y: float) -> float:
+    def _row_stepper_option(self, name: str, allowed: list[str], value: object, applied: object,
+                             dirty: bool, numeric: bool, y: float) -> float:
+        if numeric:
+            self._rows.append(_numeric_row(
+                self.canvas, y, name, value, allowed, dirty=dirty,
+                on_type=lambda text, name=name, applied=applied: self._on_number_entry(text, name, applied),
+                on_prev=lambda: self._stage_enum(name, allowed, value, -1),
+                on_next=lambda: self._stage_enum(name, allowed, value, 1),
+            ))
+            return y - _ROW_H
         label = name if len(allowed) <= 1 else f"{name}: {value}"
         if dirty:
             label += "  *"
@@ -377,20 +452,40 @@ class SettingsPanel:
         ))
         return y - _ROW_H
 
+    def _on_number_entry(self, text: str, name: str, applied: object) -> None:
+        """Commit a typed number (Enter or focus-out) — free-form, not
+        limited to the pack's own ``allowed`` step list, since typing an
+        exact value is the whole point. Invalid text is silently discarded:
+        refresh() redraws the entry with the last good value."""
+        token = _reformat_number(text, applied)
+        if token is not None and token != str(applied):
+            self._pending[name] = token
+        elif token is not None:
+            self._pending.pop(name, None)
+        self.refresh()
+
     def _row_slider(self, name: str, allowed: list[str], value: object,
                      applied: object, y: float) -> float:
         dirty = str(value) != str(applied)
         idx = allowed.index(str(value)) if str(value) in allowed else 0
         row_h = _ROW_H * 1.5
+        color = _MODIFIED_COLOR if dirty else _TEXT_COLOR
 
         row = DirectFrame(parent=self.canvas, frameColor=(0, 0, 0, 0),
                            frameSize=(_PANEL_L, _PANEL_R, y - row_h + 0.03, y + 0.032),
                            pos=(0, 0, 0))
-        label = DirectLabel(
-            parent=row, text=f"{name}: {value}" + ("  *" if dirty else ""),
-            text_scale=0.040, text_fg=_MODIFIED_COLOR if dirty else _TEXT_COLOR,
+        DirectLabel(
+            parent=row, text=name, text_scale=0.040, text_fg=color,
             text_align=TextNode.ALeft, frameColor=(0, 0, 0, 0),
             pos=(_PANEL_L + _ROW_INSET, 0, y - 0.012),
+        )
+        # The value itself is a plain typable number, not just a slider
+        # readout — allows an exact value the allowed step list may skip.
+        entry = DirectEntry(
+            parent=row, initialText=str(value), width=6, numLines=1,
+            scale=0.040, text_align=TextNode.ARight,
+            frameColor=(0.14, 0.14, 0.16, 1), text_fg=color,
+            pos=(_PANEL_R - 0.02, 0, y - 0.012),
         )
         track_w = (_PANEL_R - _ROW_INSET) - (_PANEL_L + _ROW_INSET)
         slider = DirectSlider(
@@ -402,15 +497,21 @@ class SettingsPanel:
         )
         # Dragging fires the command many times per second — rebuilding the
         # whole row list (refresh()) on every tick would destroy this very
-        # slider mid-drag, so only this row's own label/pending state is
+        # slider mid-drag, so only this row's own entry/pending state is
         # touched here; the apply bar is cheap to keep in sync directly.
         slider["command"] = self._on_slider_move
-        slider["extraArgs"] = [slider, label, name, allowed, applied]
+        slider["extraArgs"] = [slider, entry, name, allowed, applied]
+
+        def commit_typed(text, slider=slider, name=name, allowed=allowed, applied=applied):
+            self._on_slider_entry(text, slider, name, allowed, applied)
+
+        entry["command"] = commit_typed
+        entry["focusOutCommand"] = lambda entry=entry, commit=commit_typed: commit(entry.get())
 
         self._rows.append(row)
         return y - row_h
 
-    def _on_slider_move(self, slider, label, name: str, allowed: list[str], applied: object) -> None:
+    def _on_slider_move(self, slider, entry, name: str, allowed: list[str], applied: object) -> None:
         idx = int(round(slider["value"]))
         idx = max(0, min(len(allowed) - 1, idx))
         if slider["value"] != idx:
@@ -421,9 +522,25 @@ class SettingsPanel:
         else:
             self._pending[name] = value
         dirty = name in self._pending
-        label["text"] = f"{name}: {value}" + ("  *" if dirty else "")
-        label["text_fg"] = _MODIFIED_COLOR if dirty else _TEXT_COLOR
+        entry.set(str(value))
+        entry["text_fg"] = _MODIFIED_COLOR if dirty else _TEXT_COLOR
         self._sync_apply_bar()
+
+    def _on_slider_entry(self, text: str, slider, name: str, allowed: list[str], applied: object) -> None:
+        """A number typed directly into a slider row's entry — free-form,
+        like _on_number_entry, but also snaps the slider thumb to whichever
+        allowed step is closest, for visual feedback."""
+        token = _reformat_number(text, applied)
+        if token is None:
+            self.refresh()  # bad input — snap back to the last good value
+            return
+        if token != str(applied):
+            self._pending[name] = token
+        else:
+            self._pending.pop(name, None)
+        nearest = min(range(len(allowed)), key=lambda i: abs(_safe_float(allowed[i]) - _safe_float(token)))
+        slider["value"] = nearest
+        self.refresh()
 
 
 def _stepper_row(parent, y, label, *, on_prev, on_next, disabled=False, text_fg=_TEXT_COLOR):
@@ -440,3 +557,65 @@ def _stepper_row(parent, y, label, *, on_prev, on_next, disabled=False, text_fg=
                      frameSize=(-0.045, 0.045, -0.028, 0.038),
                      pos=(_PANEL_R - 0.03, 0, -0.008), command=on_next)
     return row
+
+
+def _numeric_row(parent, y, name, value, allowed, *, dirty, on_type, on_prev, on_next):
+    """Like _stepper_row, but the value is a typable DirectEntry instead of
+    a plain label — for options whose value is just a number, typing an
+    exact figure is more useful than clicking through the pack's own
+    (often coarse) allowed-value list."""
+    color = _MODIFIED_COLOR if dirty else _TEXT_COLOR
+    row = DirectFrame(parent=parent, frameColor=(0, 0, 0, 0),
+                       frameSize=(_PANEL_L, _PANEL_R, -0.022, 0.032), pos=(0, 0, y))
+    DirectLabel(parent=row, text=name, text_scale=0.040, text_fg=color,
+                text_align=TextNode.ALeft, frameColor=(0, 0, 0, 0),
+                pos=(_PANEL_L + _ROW_INSET, 0, -0.012))
+    stepper = len(allowed) > 1
+    entry = DirectEntry(
+        parent=row, initialText=str(value), width=6, numLines=1,
+        scale=0.040, text_align=TextNode.ARight,
+        frameColor=(0.14, 0.14, 0.16, 1), text_fg=color,
+        pos=(_PANEL_R - (0.20 if stepper else 0.02), 0, -0.012),
+        command=on_type,
+    )
+    entry["focusOutCommand"] = lambda entry=entry, cmd=on_type: cmd(entry.get())
+    if stepper:
+        DirectButton(parent=row, text="<", text_scale=0.04, frameColor=_BTN_COLOR,
+                     frameSize=(-0.045, 0.045, -0.028, 0.038),
+                     pos=(_PANEL_R - 0.10, 0, -0.008), command=on_prev)
+        DirectButton(parent=row, text=">", text_scale=0.04, frameColor=_BTN_COLOR,
+                     frameSize=(-0.045, 0.045, -0.028, 0.038),
+                     pos=(_PANEL_R - 0.03, 0, -0.008), command=on_next)
+    return row
+
+
+def _is_numeric(value: object) -> bool:
+    try:
+        float(str(value))
+        return True
+    except ValueError:
+        return False
+
+
+def _safe_float(value: object) -> float:
+    try:
+        return float(value)
+    except ValueError:
+        return 0.0
+
+
+def _reformat_number(text: str, applied: object) -> str | None:
+    """Parse a user-typed number, formatted back with the same decimal
+    precision as the option's currently-applied token (so typing "1.5" for
+    an option authored as "1.00" stages "1.50", matching the pack's own
+    formatting) — or None if the text isn't a number at all."""
+    text = text.strip()
+    try:
+        parsed = float(text)
+    except ValueError:
+        return None
+    applied_s = str(applied)
+    if "." in applied_s:
+        decimals = len(applied_s.split(".", 1)[1])
+        return f"{parsed:.{decimals}f}"
+    return str(int(round(parsed)))

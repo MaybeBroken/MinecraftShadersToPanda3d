@@ -96,7 +96,7 @@ class Demo(ShowBase):
         self.actor.loop("walk")
         self._animating = True
 
-        self._profile_name = "MEDIUM"
+        self._profile_name = "LOW"
         self.pipe = PipelineRenderer(
             self, pack_path, world="world0", profile=self._profile_name
         )
