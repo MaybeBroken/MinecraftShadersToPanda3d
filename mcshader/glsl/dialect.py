@@ -219,15 +219,35 @@ def translate_stage(
             introduced.append((name, decl))
 
     # gl_MultiTexCoord0 is a vec4 in Minecraft; Panda3D provides a vec2 texcoord,
-    # so promote every use to vec4 (and keep the vec2 attribute). gl_MultiTexCoord1
-    # is the block/sky lightmap, which has no engine equivalent yet — feed full
-    # bright so shaders compile and render lit.
+    # so promote every use to vec4 (and keep the vec2 attribute).
     texcoord_attr = "p3d_MultiTexCoord0" if idx == 0 else "mc_MultiTexCoord0"
     if re.search(r"\bgl_MultiTexCoord0\b", body):
         body = re.sub(r"\bgl_MultiTexCoord0\b",
                       f"vec4({texcoord_attr}, 0.0, 1.0)", body)
         introduced.append((texcoord_attr, "attrib vec2"))
-    body = re.sub(r"\bgl_MultiTexCoord1\b", "vec4(1.0)", body)
+
+    # gl_MultiTexCoord1 is Minecraft's per-vertex LIGHTMAP coordinate: `.x` is
+    # block light (torches, lava — 0 outdoors in daylight), `.y` is sky light
+    # (1 under open sky). Engine geometry has no such vertex column, so this
+    # became `vec4(1.0)` — "full bright", which pins BLOCK light at maximum
+    # everywhere. That is not a harmless placeholder: BSL's GetLighting()
+    # (lib/lighting/forwardLighting.glsl) computes
+    # `newLightmap = pow(lightmap.x, 10.0) * 1.6 + lightmap.x * 0.6` and adds
+    # `blocklightCol * newLightmap * newLightmap` — at lightmap.x = 1 that is
+    # a constant 4.84x the full torch colour added to EVERY surface, which
+    # swamps the sun term (`mix(ambientCol, lightCol, fullShadow * shadowMult)`)
+    # that shadows actually modulate. Measured on the demo scene: the whole
+    # range between "fully lit" and "fully shadowed" collapsed to ~17% of
+    # final pixel brightness, so even a perfectly correct shadow map rendered
+    # as a barely-visible grey wash.
+    #
+    # Fed instead as the per-object `mcLightmap` uniform (see
+    # PipelineRenderer.set_lightmap), defaulting to (0, 1) — outdoors under
+    # open sky, which is what an engine scene is until a caller says
+    # otherwise — mirroring how `mc_Entity` is handled just below.
+    if re.search(r"\bgl_MultiTexCoord1\b", body):
+        body = re.sub(r"\bgl_MultiTexCoord1\b", "vec4(mcLightmap, 0.0, 1.0)", body)
+        introduced.append(("mcLightmap", "uniform vec2"))
 
     # 3b. Custom Minecraft per-vertex attributes (mc_Entity, mc_midTexCoord, …)
     # have no real per-vertex data in engine-authored geometry — nothing in this

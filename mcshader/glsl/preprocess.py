@@ -30,6 +30,7 @@ def resolve_includes(
     files: dict[str, str] | None = None,
     current_dir: str = "",
     _seen: set[str] | None = None,
+    stage: str | None = None,
 ) -> str:
     """Recursively expand ``#include`` directives, OptiFine/Iris-style.
 
@@ -63,6 +64,22 @@ def resolve_includes(
     """
     if _seen is None:
         _seen = set()
+    if stage is not None:
+        # Drop the other stage's code *before* scanning this file for
+        # includes, so `_seen` only ever records what this stage actually
+        # compiles. Without it the expand-once rule is applied across the
+        # combined VSH+FSH source, and whichever stage block comes first in
+        # the file claims the single expansion of any library both blocks
+        # include — then `select_stage` deletes that block for the other
+        # stage, taking the library's only copy with it. Real symptom: with
+        # `TAA` on, gbuffers_terrain.glsl includes lib/util/jitter.glsl from
+        # both its FSH and (transitively) its VSH block; the vertex shader
+        # ended up referencing `TAAJitter` with no definition and failed to
+        # compile, so the whole scene silently fell back to Panda3D's own
+        # default shading. Applying the selection per file (rather than once
+        # at the end) is what makes "expand at most once per compiled
+        # program" mean the right thing — a program here is one *stage*.
+        source = select_stage(source, stage)
     files = files or {}
     out: list[str] = []
     for line in source.splitlines():
@@ -96,7 +113,7 @@ def resolve_includes(
                 continue
 
         out.append(resolve_includes(
-            included, base_dir, files, posixpath.dirname(key), _seen))
+            included, base_dir, files, posixpath.dirname(key), _seen, stage))
     return "\n".join(out)
 
 

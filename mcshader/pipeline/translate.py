@@ -64,7 +64,16 @@ def translate_pass(
     base_dir = pack.base_dir or "."
 
     def prep(raw: str, stage: str) -> str:
-        resolved = preprocess.resolve_includes(raw, base_dir=base_dir, files=files)
+        # Stage selection happens *inside* include expansion (see
+        # `resolve_includes`'s `stage` argument): an Iris program is one
+        # combined source with an `#ifdef VSH` and an `#ifdef FSH` block, and
+        # both blocks legitimately include the same library — each compiled
+        # stage needs its own copy, so the expand-once bookkeeping has to be
+        # per stage, not per file. The trailing `select_stage` is a no-op for
+        # a stage-aware expansion and is kept only so a caller passing
+        # already-expanded source still gets the selection applied.
+        resolved = preprocess.resolve_includes(
+            raw, base_dir=base_dir, files=files, stage=stage)
         return preprocess.select_stage(resolved, stage)
 
     vert_raw = program.vertex or program.combined

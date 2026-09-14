@@ -48,6 +48,23 @@ _MC_FORMATS = {
 
 
 class PipelineRenderer:
+    #: NodePath tag the shadow camera keys its tag-state lookup off of, so
+    #: shadow-casting geometry renders through ``shadow.glsl`` instead of its
+    #: own gbuffers program in that one pass — see `_build_shadow_pass` for
+    #: why a Camera initial state cannot do this job.
+    _SHADOW_TAG = "mcshader-shadow-pass"
+    _SHADOW_TAG_VALUE = "cast"
+
+    @staticmethod
+    def _shadow_draw_bit() -> Any:
+        """Draw-mask bit reserved for the shadow camera (see
+        `_build_shadow_pass`). A method, not a class constant, because this
+        module imports Panda3D lazily — the parsing/options/graph layers
+        must stay importable without a GL stack installed."""
+        from panda3d.core import BitMask32
+
+        return BitMask32.bit(7)
+
     def __init__(self, base: Any, pack_path: str, *, world: str = "world0",
                  profile: str | None = None, target: str = "panda3d"):
         # Panda3D pads every render-to-texture target up to the next power of
@@ -154,6 +171,15 @@ class PipelineRenderer:
                 f"{render_type!r}; available: {self.resolver.types()}"
             )
         nodepath.set_shader_input("mcEntityId", 0)
+        # Minecraft's per-vertex lightmap (block light, sky light). Engine
+        # geometry has no such vertex column, so it's a per-object uniform;
+        # default to "outdoors under open sky" — see `set_lightmap`.
+        nodepath.set_shader_input("mcLightmap", self._NAMED_DEFAULTS["mcLightmap"])
+        # Marks this subtree as shadow-casting geometry: the shadow camera's
+        # tag state swaps in shadow.glsl for it (see `_build_shadow_pass`).
+        # Set unconditionally — independent of `_enabled`, which only toggles
+        # the *visible* shading, while the offscreen chain keeps running.
+        nodepath.set_tag(self._SHADOW_TAG, self._SHADOW_TAG_VALUE)
         self._geometry.append((nodepath, render_type))
         # Respect a standing set_enabled(False): re-tagging (a rebuild after
         # an option change, a swap_pack() replay) must not silently re-shade
@@ -199,8 +225,29 @@ class PipelineRenderer:
         """
         nodepath.set_shader_input("mcEntityId", int(block_id))
 
+    def set_lightmap(self, nodepath: Any, block_light: float, sky_light: float) -> None:
+        """Set the Minecraft lightmap a gbuffers shader lights ``nodepath`` by.
+
+        Both in 0..1. ``block_light`` is artificial light (torches, lava,
+        glowstone) — 0 for anything not near a light source; ``sky_light`` is
+        exposure to the sky — 1 outdoors, falling to 0 deep indoors or
+        underground. Minecraft supplies this per vertex (``gl_MultiTexCoord1``);
+        engine-authored geometry has no equivalent, so it's exposed per object
+        here, the same approximation `set_block_id` makes for ``mc_Entity``.
+
+        This matters more than it looks: sky light scales the entire sun +
+        ambient term (``sceneLighting *= skylightSqr`` in BSL's GetLighting),
+        and block light is added on top of it, so leaving an indoor object at
+        the outdoor default lights it as if the roof weren't there.
+        """
+        from panda3d.core import LVecBase2
+
+        nodepath.set_shader_input(
+            "mcLightmap", LVecBase2(float(block_light), float(sky_light)))
+
     def clear(self, nodepath: Any) -> None:
         nodepath.clear_shader()
+        nodepath.clear_tag(self._SHADOW_TAG)
         self._geometry = [(np, rt) for np, rt in self._geometry if np != nodepath]
 
     def build_sky(self, radius: float = 900.0) -> Any:
@@ -241,6 +288,12 @@ class PipelineRenderer:
         sky.set_color(1, 0, 0, 1)
 
         self.set_render_type(sky, "sky_basic")
+        # The sky dome is a camera-locked backdrop, not a shadow caster — in
+        # Minecraft the sky isn't in the shadow pass at all. Keep it out of
+        # the shadow camera's view (it would otherwise fill shadowcolor0 with
+        # sky albedo); a dedicated draw-mask bit hides it from that camera
+        # only, leaving it visible to the main (all-on mask) camera.
+        sky.hide(self._shadow_draw_bit())
         self._sky_np = sky
         return sky
 
@@ -310,9 +363,11 @@ class PipelineRenderer:
         self._colortex.clear()
         self._colortex_back.clear()
         self._buffers = []
+        self._depth_tex = None
         for nodepath, _ in self._geometry:
             try:
                 nodepath.clear_shader()
+                nodepath.clear_tag(self._SHADOW_TAG)
             except Exception:
                 pass
         self._geometry.clear()
@@ -378,6 +433,23 @@ class PipelineRenderer:
         h = self.base.win.get_y_size() if self.base.win else 720
         tex = Texture(f"colortex{index}")
         tex.setup_2d_texture(w, h, Texture.T_float, self._tex_format(mc_format))
+        # Zero the texture's backing store ONCE, at creation, before any pass
+        # can read it. Per-frame clearing is a separate decision made in
+        # `_make_buffer` from the pack's `colortexNClear` — and for the
+        # buffers that declare `false` (BSL's colortex2/5/9, real cross-frame
+        # history) that meant the texture was never cleared *at all*, so a
+        # pack's very first read of it saw uninitialized VRAM. On a float
+        # target that garbage can be a NaN bit pattern, and NaN here is not
+        # self-correcting but self-*sustaining*: BSL's TAA history lives in
+        # colortex2, and `TemporalAA()` guards only against an exactly-zero
+        # history (`tempColor == vec3(0.0)`, false for NaN) while `ClipAABB`'s
+        # `if (ma_unit > 1.0)` rescue branch is also false for NaN (every IEEE
+        # comparison with NaN is), so the NaN is blended into the frame and
+        # written straight back into the history, forever. That is the whole
+        # "TAA blacks out large regions and never recovers" failure — a
+        # first-frame initialization bug, not a bug in the TAA math.
+        tex.set_clear_color((0.0, 0.0, 0.0, 0.0))
+        tex.clear_image()
         tex.set_wrap_u(Texture.WM_clamp)
         tex.set_wrap_v(Texture.WM_clamp)
         tex.set_minfilter(Texture.FT_linear)
@@ -489,6 +561,35 @@ class PipelineRenderer:
             "mcshader-gbuffer", gbuffer_indices, want_depth=True, sort=-100)
         self._scene_buf.set_clear_color((0, 0, 0, 1))
         self._bind_scene_attachments(self._scene_buf)
+        # The gbuffer pass's real depth buffer, as a texture — this is what
+        # every pack means by `depthtex0/1/2`. It was never attached before
+        # (the FBO had depth *bits*, but nothing to sample them through), and
+        # `_bind_inputs` fed those three samplers **colortex0**, the scene
+        # ALBEDO, instead. Every screen-space effect BSL has is built on
+        # `texture2D(depthtex0, texCoord).r` + `GetLinearDepth()` — SSAO
+        # (lib/lighting/ambientOcclusion.glsl), light shafts, volumetric fog,
+        # SSR (lib/reflections/roughReflections.glsl), outlines, DOF,
+        # composite5's focus — so all of them were reading a colour channel
+        # as a depth value. That is the cause of the reported AO symptoms
+        # specifically: AO's `if (z >= 1.0) return 1.0;` sky/background
+        # early-out never fires on dark albedo, so it marches occlusion
+        # samples through nonsense geometry everywhere (black patches), and
+        # its dither is rotated per frame (`dither + frameCounter * 0.618`),
+        # which turns that nonsense into per-frame flicker.
+        from panda3d.core import Texture, GraphicsOutput
+
+        depth = Texture("mcshader-depth")
+        depth.set_wrap_u(Texture.WM_clamp)
+        depth.set_wrap_v(Texture.WM_clamp)
+        # Plain (non-comparison) sampling, unfiltered: packs declare depthtexN
+        # as `sampler2D` and read the raw window-space depth out of `.r`.
+        # Interpolating between two depths would invent surfaces that aren't
+        # there along every silhouette — exactly where AO and SSR sample most.
+        depth.set_minfilter(Texture.FT_nearest)
+        depth.set_magfilter(Texture.FT_nearest)
+        self._scene_buf.add_render_texture(
+            depth, GraphicsOutput.RTM_bind_or_copy, GraphicsOutput.RTP_depth)
+        self._depth_tex = depth
         dr = self._scene_buf.make_display_region()
         dr.set_camera(self.base.cam)
 
@@ -653,8 +754,22 @@ class PipelineRenderer:
         dist = float(self.options.get("shadowDistance")) if "shadowDistance" in self.options.options else 256.0
         self._shadow_dist = dist
         lens = OrthographicLens()
-        lens.set_film_size(dist, dist)
-        lens.set_near_far(1.0, dist * 2.0)
+        # `shadowDistance` is a *half*-extent, not a width: Iris builds the
+        # shadow projection as ortho(-shadowDistance, +shadowDistance, ...)
+        # and BSL's own math assumes exactly that. Panda's `set_film_size`
+        # takes the full width, so it needs 2 * dist. With `dist` passed
+        # verbatim the frustum covered only half the range the pack thinks
+        # it does, and `GetShadow()`'s own in-frustum test
+        # (`shadowPos.xy` inside (0,1) after `DistortShadow`'s `*0.5+0.5`)
+        # rejected everything past shadowDistance/2 from the player,
+        # returning `vec3(1.0)` — "fully lit" — for most of the visible
+        # scene. That is why no cast shadow appeared anywhere.
+        lens.set_film_size(dist * 2.0, dist * 2.0)
+        # Centred on the player like Iris's own: the camera sits one full
+        # shadowDistance up-sun (see below) and the depth range spans 2*dist,
+        # so shadow space brackets the player symmetrically (+dist above,
+        # -dist below) instead of being lopsided.
+        lens.set_near_far(0.01, dist * 2.0)
         cam = Camera("mcshader-shadow-cam", lens)
         # Reuse the same "gbuffer"-mode shader checked for existence above —
         # this used to call self._compile("shadow") again with no mode
@@ -664,9 +779,46 @@ class PipelineRenderer:
         # BSL (whose shadow.glsl only ever writes gl_FragData[0], where both
         # modes number identically) but not general, and wasteful either way.
         from panda3d.core import ShaderAttrib, RenderState
+        # A Camera's *initial state* is only the starting point of the cull
+        # traversal: each node's own state is composed on top of it, and a
+        # per-node ShaderAttrib (which is exactly what `set_render_type` sets
+        # on every tagged NodePath) therefore WINS over it — with no override
+        # priority able to change that. Verified directly on this GPU: with
+        # only an initial state, the shadow buffer rendered every object with
+        # its own *gbuffers* program, never shadow.glsl. That is catastrophic
+        # rather than cosmetic, because gbuffers_*.vsh computes `gl_Position`
+        # from `gl_ProjectionMatrix * gbufferModelView * position` (+
+        # `TAAJitter`) and so omits shadow.vsh's `DistortShadow` warp
+        # (`gl_Position.xy /= distortFactor; gl_Position.z *= 0.2`) — while
+        # `GetShadow()` in lib/lighting/shadows.glsl *does* apply that warp
+        # when sampling. Render and sample disagreed, and since the warp is
+        # centred on the shadow frustum (which follows the player), the
+        # mismatch slid around with the camera: the reported "shadows aren't
+        # locked to the world, they move with the player". The per-frame
+        # TAA jitter in the same vertex shader added the reported flicker.
+        #
+        # Panda's tag-state mechanism is the supported way to say "render
+        # this shared scene graph with a different shader for THIS camera":
+        # the camera looks up each node's `_SHADOW_TAG` tag and composes the
+        # matching state *after* the node's own, so the shadow program wins
+        # while every shader input (samplers bound on render, mcEntityId on
+        # the node) is preserved — confirmed by direct readback.
+        cam.set_tag_state_key(self._SHADOW_TAG)
+        cam.set_tag_state(self._SHADOW_TAG_VALUE,
+                          RenderState.make(ShaderAttrib.make(shadow_shader)))
+        # Still the fallback for geometry that carries no render-type tag
+        # (untagged props should cast a shadow like anything else).
         cam.set_initial_state(
             RenderState.make(ShaderAttrib.make(shadow_shader)))
+        # A dedicated draw-mask bit lets individual nodes opt out of the
+        # shadow pass without disappearing from the main camera (whose mask
+        # is all-on): `np.hide(_SHADOW_DRAW_BIT)` clears just this bit. Used
+        # for the sky dome, which is a camera-locked backdrop, not a caster.
+        cam.set_camera_mask(self._shadow_draw_bit())
         self._shadow_cam = self.base.render.attach_new_node(cam)
+        sky_np = getattr(self, "_sky_np", None)
+        if sky_np is not None:
+            sky_np.hide(self._shadow_draw_bit())
         # Point the shadow camera down the sun direction, centred on the
         # PLAYER (base.cam), not the world origin. Minecraft's own shadow
         # frustum is always player-relative — the world has no meaningful
@@ -689,7 +841,7 @@ class PipelineRenderer:
         # native Z-up to be positioned correctly — see `_cs_conversion`.
         _, cs_yup_to_zup = self._cs_conversion()
         sun_panda = cs_yup_to_zup.xform_vec(self._sun_direction())
-        self._shadow_cam.set_pos(center + sun_panda * (dist * 0.5))
+        self._shadow_cam.set_pos(center + sun_panda * dist)
         self._shadow_cam.look_at(center, self._safe_up(-sun_panda))
         dr = self._shadow_buf.make_display_region()
         dr.set_camera(self._shadow_cam)
@@ -737,6 +889,7 @@ class PipelineRenderer:
     def _build_fullscreen_chain(self) -> None:
         from panda3d.core import CardMaker, NodePath, Camera, OrthographicLens
 
+        self._swaps: dict[int, int] = {}
         values = self.options.values()
         passes = [p for p in self.graph.fullscreen_passes()
                   if p.kind != "shadowcomp" and p.enabled(values)]
@@ -758,6 +911,7 @@ class PipelineRenderer:
                 self._final_quads.append(quad)
                 if not self._enabled:  # a rebuild while pack is toggled off
                     quad.hide()
+        self._build_history_resolves(len(passes))
 
     def _render_quad(self, quad: Any, p: Any, *, is_final: bool, order: int,
                      hazards: frozenset[int] | set[int] = frozenset()) -> None:
@@ -810,6 +964,81 @@ class PipelineRenderer:
             if colortex in targets[:n_color]:
                 self._colortex[colortex], self._colortex_back[colortex] = (
                     self._colortex_back[colortex], self._colortex[colortex])
+                self._swaps[colortex] = self._swaps.get(colortex, 0) + 1
+
+    #: Trivial fullscreen copy, for `_build_history_resolves`.
+    _RESOLVE_FRAGMENT = """\
+#version 330
+uniform sampler2D mcResolveSrc;
+in vec2 texcoord;
+layout(location = 0) out vec4 mcResolveOut;
+
+void main() {
+    mcResolveOut = texture(mcResolveSrc, texcoord);
+}
+"""
+
+    def _build_history_resolves(self, order: int) -> None:
+        """Close the ping-pong cycle for persistent buffers whose passes leave
+        it open, so a cross-frame history buffer really carries a frame over.
+
+        A pass that both samples and writes the same ``colortex`` renders into
+        the ping-pong twin and then swaps, so its *next* reader sees the fresh
+        write (see `_render_quad`). Those bindings are established once, at
+        build time, and never change — which silently assumes an EVEN number of
+        such passes per buffer, so the swaps cycle back around to where they
+        started. BSL's colortex2 satisfies that only with TAA on (composite5
+        writes it, composite7 reads-and-rewrites it); with TAA off composite5
+        is the lone self-reader, and then its sampler is permanently bound to a
+        texture that **nothing ever writes**. It reads the same zeros every
+        frame, forever.
+
+        That is not a subtle loss: colortex2 with `colortex2Clear = false` is
+        where BSL keeps AUTO_EXPOSURE's adapted exposure, LENS_FLARE's sun
+        visibility and DOF's focus distance (see composite5.glsl's
+        `temporalData`). A permanently-zero `tempExposure` pins
+        `AutoExposure`'s `color /= 2.0 * tempExposure + 0.125` at a fixed 8x
+        gain — auto-exposure stops adapting and the frame is blown out.
+        colortex9 (BSL's other odd-parity persistent buffer) has the same
+        problem.
+
+        The fix is one trivial fullscreen copy per affected buffer, ordered
+        after every other pass: front -> back, which is exactly the "missing"
+        second swap. The pass that reads the back texture next frame then sees
+        this frame's result. Only buffers the pack declares
+        ``colortexNClear = false`` need it — a cleared buffer has no history to
+        carry — so this costs at most a few blits (three for BSL).
+        """
+        from panda3d.core import (CardMaker, NodePath, Camera, OrthographicLens,
+                                  Shader, GraphicsOutput)
+        from ..glsl.fullscreen import FULLSCREEN_VERTEX
+
+        stranded = [idx for idx, n in sorted(self._swaps.items())
+                    if n % 2 == 1 and not self.graph.buffers.clear.get(idx, True)]
+        if not stranded:
+            return
+        shader = Shader.make(Shader.SL_GLSL, vertex=FULLSCREEN_VERTEX,
+                             fragment=self._RESOLVE_FRAGMENT)
+        for i, idx in enumerate(stranded):
+            cm = CardMaker(f"mcshader-resolve{idx}")
+            cm.set_frame_fullscreen_quad()
+            scene = NodePath(f"mcshader-resolve-scene{idx}")
+            quad = NodePath(cm.generate())
+            quad.reparent_to(scene)
+            quad.set_shader(shader)
+            quad.set_shader_input("mcResolveSrc", self._colortex[idx])
+            quad.set_depth_test(False)
+            quad.set_depth_write(False)
+            lens = OrthographicLens()
+            lens.set_film_size(2, 2)
+            lens.set_near_far(-1000, 1000)
+            cam = scene.attach_new_node(Camera(f"mcshader-resolve-cam{idx}", lens))
+            buf = self._make_buffer(f"mcshader-resolve{idx}", [idx], want_depth=False,
+                                    sort=-50 + order + i)
+            buf.add_render_texture(self._colortex_back[idx],
+                                   GraphicsOutput.RTM_bind_or_copy, GraphicsOutput.RTP_color)
+            buf.make_display_region().set_camera(cam)
+            self._quads.append(quad)
 
     _UNIFORM_RE = None
 
@@ -842,6 +1071,21 @@ class PipelineRenderer:
             tex.set_ram_image(bytes([0, 0, 0, 255]))
             self._fallback = tex
         return self._fallback
+
+    def _opaque_white_tex(self) -> Any:
+        """A 1x1 opaque white texture — the neutral stand-in wherever "no
+        data" must mean *maximum*, not zero: an absent ``shadowcolor`` (fully
+        transmitted light, no tint) and an absent depth buffer (1.0 = the far
+        plane; a black fallback would read as the near plane, i.e. every
+        pixel occluded by a surface pressed against the lens)."""
+        from panda3d.core import Texture
+
+        if getattr(self, "_opaque_white", None) is None:
+            tex = Texture("mcshader-opaque-white")
+            tex.setup_2d_texture(1, 1, Texture.T_unsigned_byte, Texture.F_rgba)
+            tex.set_ram_image(bytes([255, 255, 255, 255]))
+            self._opaque_white = tex
+        return self._opaque_white
 
     def _fallback_normal_tex(self) -> Any:
         """A flat tangent-space normal map (decodes to (0,0,1), i.e. "no bump").
@@ -889,20 +1133,25 @@ class PipelineRenderer:
         # back a 0/1 comparison result, not albedo, wherever the GSG doesn't
         # give the two bindings independent sampler state.
         shadow_color = getattr(self, "_shadow_color_tex", None)
-        opaque_white = getattr(self, "_opaque_white_tex", None)
-        if opaque_white is None:
-            from panda3d.core import Texture as _Texture
-            opaque_white = _Texture("mcshader-opaque-white")
-            opaque_white.setup_2d_texture(1, 1, _Texture.T_unsigned_byte, _Texture.F_rgba)
-            opaque_white.set_ram_image(bytes([255, 255, 255, 255]))
-            self._opaque_white_tex = opaque_white
+        opaque_white = self._opaque_white_tex()
         bind("shadowcolor0", shadow_color if shadow_color is not None else opaque_white)
         # shadow.glsl only ever writes gl_FragData[0]; shadowcolor1 has no
         # producer in this pack, so it gets the semantically-neutral
         # "fully lit, no tint" default rather than aliasing shadowcolor0.
         bind("shadowcolor1", opaque_white)
+        # depthtex0/1/2: the scene's real depth buffer (see
+        # `_build_scene_target`). Minecraft distinguishes them by what's
+        # excluded — 0 = everything, 1 = no translucents, 2 = no translucents
+        # or handheld — which needs separate depth copies taken at different
+        # points of the geometry pass; we render one depth buffer, so all
+        # three get it. That's exact for an opaque scene and only differs
+        # behind translucents (BSL uses the 0-vs-1 delta for water fog depth).
+        # The fallback must be WHITE, not the black `_fallback_tex`: depth 0
+        # is the near plane, i.e. "a surface pressed against the camera",
+        # which reads as fully occluded everywhere.
+        depth_tex = getattr(self, "_depth_tex", None)
         for s in ("depthtex0", "depthtex1", "depthtex2"):
-            bind(s, self._colortex.get(0, self._fallback_tex()))
+            bind(s, depth_tex if depth_tex is not None else self._opaque_white_tex())
         bind("noisetex", self._fallback_tex())
         # A fullscreen quad has no model texture; give its base sampler colortex0.
         if is_quad:
@@ -1055,7 +1304,7 @@ class PipelineRenderer:
             # ever looking right near (0,0,0).
             dist = getattr(self, "_shadow_dist", 256.0)
             sun_panda = cs_yup_to_zup.xform_vec(sun_mc)
-            shadow_cam_np.set_pos(cam_pos + sun_panda * (dist * 0.5))
+            shadow_cam_np.set_pos(cam_pos + sun_panda * dist)
             shadow_cam_np.look_at(cam_pos, self._safe_up(-sun_panda))
 
             # Same standard-convention fix as `proj` above — confirmed the
@@ -1142,6 +1391,11 @@ class PipelineRenderer:
     # entity/actor regardless of its own texture.
     _NAMED_DEFAULTS = {
         "entityColor": (0.0, 0.0, 0.0, 0.0),
+        # (block light, sky light) — see `set_lightmap` and dialect.py's
+        # gl_MultiTexCoord1 handling. Outdoors in daylight is (0, 1); the old
+        # "full bright" (1, 1) placeholder added a constant 4.84x torch-light
+        # term to every surface, which drowned out the sun/shadow contrast.
+        "mcLightmap": (0.0, 1.0),
     }
 
     def _default_for(self, gtype: str) -> Any:
@@ -1186,7 +1440,15 @@ class PipelineRenderer:
         if sky_np is not None:
             # A skybox must stay centred on the viewer, not the world origin,
             # or the camera would eventually pass through its wall.
-            sky_np.set_pos(self.base.render, dynamic["cameraPosition"])
+            #
+            # This must be the camera's position in *Panda's* native Z-up
+            # scene graph. `dynamic["cameraPosition"]` is the same point
+            # already converted into Minecraft's Y-up convention for the
+            # shaders (see `_dynamic_uniforms`) — feeding that back into
+            # `set_pos` swaps the dome's vertical offset onto a horizontal
+            # axis, so the dome drifts sideways (and sinks) as the camera
+            # climbs, eventually clipping through it.
+            sky_np.set_pos(self.base.render, self.base.cam.get_pos(self.base.render))
         for node in [self.base.render] + self._quads:
             for name, gtype in self._uniform_types.items():
                 value = dynamic.get(name)

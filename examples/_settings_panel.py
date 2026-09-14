@@ -33,7 +33,7 @@ __all__ = ["SettingsPanel"]
 # system, not window-relative aspect2d units — see _reposition() for how
 # that's turned into a constant on-screen pixel size. _SCALE=300 was chosen
 # to match this panel's original look on a plain 800x600 window.
-_SCALE = 300
+_SCALE = 600
 _MARGIN_NDC = 0.02  # small gap from the true screen edge, as a fraction of
                     # render2d's -1..1 span (~8px on an 800px-wide window)
 
