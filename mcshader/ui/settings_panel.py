@@ -10,11 +10,11 @@ settings screen (which batches edits behind a "Done" button) and, since
 ``recompile()`` rebuilds the whole shader graph, avoids paying that cost on
 every single click.
 
-    from _settings_panel import SettingsPanel
+    from mcshader.ui import SettingsPanel
     panel = SettingsPanel(base, pipe, profiles=["MINIMUM", "LOW", "MEDIUM", "HIGH", "ULTRA"])
     base.accept("o", panel.toggle)
 
-Purely a demo/dev-tool convenience built on the engine-side options API
+Purely a dev-tool convenience built on the engine-side options API
 (``mcshader.config.options.ShaderOptions``) — nothing here is pipeline
 machinery, and nothing here touches shader source directly.
 """

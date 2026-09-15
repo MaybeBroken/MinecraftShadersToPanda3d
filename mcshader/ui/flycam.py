@@ -1,4 +1,4 @@
-"""Shared WASD + arrow-key fly camera for the example demos.
+"""WASD + arrow-key fly camera, for poking at a shaded scene by hand.
 
 Moves ``base.cam`` directly (not ``base.camera``, its parent) — that's the
 node the pipeline renderer actually reads for its view matrices (see

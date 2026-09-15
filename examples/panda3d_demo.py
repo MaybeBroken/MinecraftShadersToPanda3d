@@ -22,7 +22,7 @@ from direct.gui.OnscreenText import OnscreenText
 from panda3d.core import AmbientLight, DirectionalLight, TextNode, Vec4
 
 from mcshader.engine import Panda3DAdapter
-from _flycam import attach_fly_camera
+from mcshader.ui import attach_fly_camera
 
 HELP = """mcshader per-object effects demo
 WASD/QE fly, arrows look, shift boost

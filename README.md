@@ -12,37 +12,75 @@ translation layers are engine-independent (and fully unit-tested without a GPU),
 so other OpenGL backends can be added.
 
 ```python
-from mcshader.engine import PipelineRenderer
+import mcshader
 
-pipe = PipelineRenderer(base, "Shaders/", world="world0", profile="HIGH")
+app = mcshader.init()                        # window + pack + sky + fly camera
+app.load("models/environment", type="terrain", scale=0.25)
+app.load_actor("models/panda-model", {"walk": "models/panda-walk4"},
+               type="entity", block="minecraft:sea_lantern", loop="walk")
 
-pipe.set_render_type(ground, "terrain")     # each object renders as an MC type
-pipe.set_render_type(water,  "water")
-pipe.set_render_type(crystal, "glowing")
-pipe.set_block_id(crystal, pipe.resolver.block_id("minecraft:sea_lantern"))
-
-pipe.apply_profile("ULTRA")                  # Iris-style quality profiles
-pipe.set_option("SHADOW_FILTER", True); pipe.recompile()
-pipe.swap_pack("SomeOtherPack.zip")          # re-shade everything, tags preserved
+app.profile = "ULTRA"                        # Iris-style quality profiles
+app.option("SHADOW_FILTER", True)            # any option the pack declares
+app.swap_pack("SomeOtherPack.zip")           # re-shade everything, tags preserved
+app.run()
 ```
+
+That's the whole program — `init()` creates the Panda3D `ShowBase`, finds a
+pack, builds the procedural sky and starts the pipeline. Shading a game you
+already have is the same call with your own engine handle:
+
+```python
+app = mcshader.init(base)                    # your ShowBase, your scene graph
+app.attach(ground, type="terrain")
+app.attach(crystal, type="glowing", block="minecraft:sea_lantern")
+```
+
+Nothing is hidden behind it: `app.pipe` is the full `PipelineRenderer` and
+`app.base` your `ShowBase`, so dropping to the low-level API (below) or to raw
+Panda3D is never a dead end.
+
+| | |
+|---|---|
+| `init(base=None, pack=None, …)` | make (or adopt) the window, load a pack, build the sky, start the pipeline |
+| `load` / `load_actor` | load a model or animated `Actor`, place it (`pos`/`hpr`/`scale`), tag it |
+| `attach` / `set_type` / `set_block` / `set_light` | shade a node you made yourself, or change one later |
+| `load(..., tag=[(regex, type), …])` | bulk-tag a model's sub-parts by naming convention |
+| `app.profile` / `app.option(name[, value])` / `app.options` | Iris-style profiles and every option the pack declares |
+| `swap_pack` / `reload` / `app.enabled` | re-shade with another pack, recompile, or A/B against plain Panda3D |
+| `camera` / `fly_camera` / `go_home` | pose and fly the camera the pipeline reads its matrices from |
+| `app.buffers` / `view` / `debug_ui` | inspect raw `colortex` buffers; install the whole dev HUD |
+| `key` / `every_frame` / `text` / `screenshot` / `run` | the Panda3D bits you'd otherwise write by hand |
+
+Block ids and lightmaps set through the app are re-applied for you after every
+recompile, profile switch and pack swap — the raw runner drops those on a
+rebuild.
 
 ## Install
 
 ```bash
-pip install -e ".[panda3d]"   # the pipeline runner + demo
-pip install -e ".[dev]"       # tests
+pip install ".[panda3d]"      # the pipeline runner + demo
+pip install -e ".[dev]"       # editable, with tests
+```
+
+Then, to see it running on real geometry:
+
+```bash
+python -m mcshader demo       # the bundled scene, any pack it can find
+python -m mcshader demo Shaders/BSL_v10.0.zip --profile ULTRA
 ```
 
 The core (parsing, options, graph, translation) has **no dependencies**; only the
-Panda3D runner needs `panda3d`.
+Panda3D runner needs `panda3d`, and importing `mcshader` never imports Panda3D
+until you actually call `init()`.
 
 ## The three subsystems
 
 ### 1. The deferred pipeline runner
 
-`PipelineRenderer` loads a pack, builds its render graph, and runs the passes in
-the correct order into a shared `colortex` buffer pool, exactly as the pack
-declares them:
+`mcshader.init()` is the front door (see above); `PipelineRenderer` is what it
+drives, and what you'd reach for to own the wiring yourself. It loads a pack,
+builds its render graph, and runs the passes in the correct order into a shared
+`colortex` buffer pool, exactly as the pack declares them:
 
 ```
 shadow map ─▶ opaque gbuffers ─▶ deferred* ─▶ translucent gbuffers ─▶ composite* ─▶ final
@@ -97,12 +135,16 @@ python -m mcshader show     Shaders/ gbuffers_water --stage fragment
 python -m mcshader extract  Shaders/ gbuffers_terrain --out ./out
 ```
 
-Inspect a pack headlessly from Python with `examples/pipeline_describe.py`, or run
-the live demo with `examples/pipeline_demo.py` (needs `panda3d` + a display). The
-demo runs the pipeline over Panda3D's own bundled "environment" island (real
-ground/rock/tree/bamboo textures) plus an animated actor, tagged in bulk by name
-pattern via `examples/_tagging.py` — the same way a real game's assets would be
-tagged, not object-by-object.
+One command there does need a GPU — `python -m mcshader demo [pack]` (same as
+`examples/pipeline_demo.py`): the pipeline over Panda3D's own bundled
+"environment" island (real ground/rock/tree/bamboo textures) plus an animated
+actor, tagged in bulk by name pattern — the same way a real game's assets would
+be tagged, not object-by-object. Its source (`mcshader/demo.py`) is also the
+worked example for the one-call API, and its on-screen HUD (profile hotkeys,
+the pack's live settings panel, pack on/off, the raw-buffer viewer) is one call
+you can put on your own app: `app.debug_ui()`.
+
+Inspect a pack headlessly from Python with `examples/pipeline_describe.py`.
 
 ## Honest limitations
 
@@ -223,7 +265,7 @@ correct against the coordinate fix above — confirmed via screenshot) and
 `LENS_FLARE` (on by default in BSL, previously always-inert) to actually
 work now that their shared gating buffer holds real data.
 
-A sixth addition: `examples/_settings_panel.py`'s `SettingsPanel` renders the
+A sixth addition: `mcshader/ui/settings_panel.py`'s `SettingsPanel` renders the
 pack's *entire* Iris-style options menu (`ShaderOptions.menu_tree` — every
 screen/toggle/slider it declares) as a live, navigable DirectGUI panel in the
 demo (`[o]` to open) — change a value, watch `set_option()` + `recompile()`
@@ -379,7 +421,7 @@ again with the *default* mode (`"compact"`, meant for fullscreen quads, not
 real scene geometry) for the shader actually bound to the shadow camera.
 Harmless for BSL (`shadow.glsl` only ever writes `gl_FragData[0]`, where both
 modes number identically) but wrong in general and wasteful either way; now
-compiled once and reused. And two `examples/pipeline_demo.py` GUI bugs
+compiled once and reused. And two demo GUI bugs
 assuming every pack has a `SHADOW` toggle option by that exact name
 (Complementary gates shadows on the numeric `SHADOW_QUALITY` instead): `[z]`
 (toggle shadow) raised a bare `KeyError`, and the on-screen status HUD had
@@ -413,7 +455,8 @@ find which one, before assuming any particular cause.
 
 ## Demo GUI fixes (pack on/off toggle + button-interaction bugs)
 
-Went through `examples/pipeline_demo.py` and `examples/_settings_panel.py`
+Went through the demo and `SettingsPanel` (then `examples/pipeline_demo.py`
+and `examples/_settings_panel.py`; now `mcshader/demo.py` and `mcshader/ui/`)
 looking for buttons/hotkeys that don't do what they claim, and added the
 requested pack on/off toggle:
 
@@ -521,6 +564,9 @@ mcshader/
   config/      options: discovery, profiles, source rewriting, menu tree, option file
   pipeline/    graph (passes/buffers/DRAWBUFFERS), rendertypes (+block ids), translate
   engine/      PipelineRenderer (the runner) + Panda3DAdapter/GenericGLAdapter (simple mode)
+  ui/          fly camera, bulk name-pattern tagging, the live settings panel
+  app.py       the one-call facade: init() -> ShaderApp (load/attach/profile/view/debug_ui)
+  demo.py      the bundled demo scene (python -m mcshader demo)
   decompiler.py, registry.py, __main__.py (CLI)
 examples/      pipeline_demo.py, pipeline_describe.py, list_pack_effects.py, panda3d_demo.py
 tests/         pytest — parsing, options, graph, translation, integration (no GPU)

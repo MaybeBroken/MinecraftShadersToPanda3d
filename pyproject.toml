@@ -38,6 +38,7 @@ packages = [
     "mcshader.pipeline",
     "mcshader.effects",
     "mcshader.engine",
+    "mcshader.ui",
 ]
 
 [tool.setuptools.package-data]

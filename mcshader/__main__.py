@@ -1,9 +1,10 @@
-"""Command-line access to the decompiler and pipeline (all GPU-free).
+"""Command-line access to the decompiler and pipeline (GPU-free except ``demo``).
 
     python -m mcshader pipeline <pack> [--world world0] [--profile HIGH]
     python -m mcshader options  <pack> [--profile HIGH] [--screen LIGHTING]
     python -m mcshader list     <pack>
     python -m mcshader show     <pack> <program> [--world world0] [--stage vertex|fragment]
+    python -m mcshader demo     [pack]   (needs panda3d + a display)
     python -m mcshader effects
     python -m mcshader extract  <pack> <program> --out <dir> [--target panda3d|generic]
 """
@@ -135,6 +136,14 @@ def _cmd_extract(args: argparse.Namespace) -> int:
     return 0 if written else 1
 
 
+def _cmd_demo(args: argparse.Namespace) -> int:
+    """The one command here that needs a GPU: run the bundled demo scene."""
+    from .demo import run
+
+    run(args.pack, profile=args.profile or "LOW")
+    return 0
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="mcshader", description=__doc__)
     sub = parser.add_subparsers(dest="cmd", required=True)
@@ -162,6 +171,12 @@ def main(argv: list[str] | None = None) -> int:
     p.add_argument("--stage", choices=("vertex", "fragment"), default="fragment")
     p.add_argument("--target", choices=("panda3d", "generic"), default="panda3d")
     p.set_defaults(func=_cmd_show)
+
+    p = sub.add_parser("demo", help="run the bundled demo scene (needs panda3d)")
+    p.add_argument("pack", nargs="?", default=None,
+                   help="a pack dir/zip; searched for if omitted")
+    p.add_argument("--profile", default=None)
+    p.set_defaults(func=_cmd_demo)
 
     p = sub.add_parser("effects", help="list built-in effects")
     p.set_defaults(func=_cmd_effects)
