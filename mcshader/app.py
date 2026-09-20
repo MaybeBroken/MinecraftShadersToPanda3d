@@ -94,14 +94,17 @@ class _Tagged:
     scene's materials.
     """
 
-    __slots__ = ("np", "type", "block", "light")
+    __slots__ = ("np", "type", "block", "light", "normal", "specular")
 
     def __init__(self, np: Any, render_type: str | None,
-                 block: int | str | None, light: tuple[float, float] | None):
+                 block: int | str | None, light: tuple[float, float] | None,
+                 normal: Any = None, specular: Any = None):
         self.np = np
         self.type = render_type
         self.block = block
         self.light = light
+        self.normal = normal
+        self.specular = specular
 
 
 class ShaderApp:
@@ -200,12 +203,17 @@ class ShaderApp:
 
     def attach(self, nodepath: Any, *, type: str | None = None,
                block: int | str | None = None,
-               light: tuple[float, float] | None = None) -> Any:
+               light: tuple[float, float] | None = None,
+               normal: Any = None, specular: Any = None) -> Any:
         """Shade a node you made yourself (or retag one you already gave us).
 
         Re-applied for you after every recompile, profile switch and pack
-        swap — including ``block`` and ``light``, which the raw runner drops
-        on a rebuild.
+        swap — including ``block``, ``light`` and the PBR maps, all of which
+        the raw runner drops on a rebuild.
+
+        ``normal`` and ``specular`` are labPBR maps for this node; see
+        :meth:`~mcshader.engine.panda3d_pipeline.PipelineRenderer.set_material_maps`
+        for the channel layout and what else has to be true for them to be read.
         """
         entry = next((t for t in self._tagged if t.np == nodepath), None)
         if entry is None:
@@ -217,6 +225,10 @@ class ShaderApp:
             entry.block = block
         if light is not None:
             entry.light = light
+        if normal is not None:
+            entry.normal = normal
+        if specular is not None:
+            entry.specular = specular
         self._apply(entry)
         return nodepath
 
@@ -230,6 +242,35 @@ class ShaderApp:
 
     def set_light(self, nodepath: Any, block_light: float, sky_light: float) -> Any:
         return self.attach(nodepath, light=(block_light, sky_light))
+
+    def set_material_maps(self, nodepath: Any, normal: Any = None,
+                          specular: Any = None) -> Any:
+        """Give one node its own labPBR normal/specular maps."""
+        return self.attach(nodepath, normal=normal, specular=specular)
+
+    def set_eye_in_water(self, state: int) -> None:
+        """Tell the pack the camera is under water (1), in lava (2) or in air (0).
+
+        Drives every submerged effect the pack has -- water fog, underwater distortion,
+        light shafts through water, and which side of the surface its fresnel is computed
+        for. An engine has to call this itself; unfed, the pack renders as though the
+        camera were never in water.
+        """
+        self.pipe.set_eye_in_water(state)
+
+    def set_eye_brightness(self, block_light: float, sky_light: float,
+                           *, immediate: bool = False) -> None:
+        """How lit the place the camera is standing in is, as (block, sky) in 0..1.
+
+        The pack's ``eyeBrightnessSmooth``. Distinct from :meth:`set_light`, which
+        describes a *surface*: this describes the viewer, and the pack reads it to
+        decide how much daylight reaches the air around them -- the fog's density
+        and colour, and the tint of water fog seen from under the surface. Left
+        unfed the camera is treated as standing outdoors under open sky, because
+        the alternative default (zero) reads as "sealed in a cave" and quietly
+        turns those effects black. Pass ``immediate=True`` after a teleport.
+        """
+        self.pipe.set_eye_brightness(block_light, sky_light, immediate=immediate)
 
     def tag_by_pattern(self, root: Any, rules: Sequence[tuple[str, str]], *,
                        default: str | None = None) -> dict[str, int]:
@@ -275,12 +316,14 @@ class ShaderApp:
                 entry.np, self.block_id(block) if isinstance(block, str) else int(block))
         if entry.light is not None:
             self.pipe.set_lightmap(entry.np, *entry.light)
+        if entry.normal is not None or entry.specular is not None:
+            self.pipe.set_material_maps(entry.np, entry.normal, entry.specular)
 
     # -- camera ---------------------------------------------------------
     def camera(self, *, pos: Sequence[float] | None = None,
                look_at: Sequence[float] | None = None,
                hpr: Sequence[float] | None = None,
-               fov: float | None = None, far: float | None = None) -> Any:
+               fov: float | None = None, far: float | None = None, near: float | None = None) -> Any:
         """Pose the camera (and remember the pose as ``debug_ui``'s [g] home).
 
         Moves ``base.cam``, not ``base.camera`` — that's the node the
@@ -297,6 +340,8 @@ class ShaderApp:
             self.base.camLens.set_fov(fov)
         if far is not None:
             self.base.camLens.set_far(far)
+        if near is not None:
+            self.base.camLens.set_near(near)
         self._home = (cam.get_pos(), cam.get_hpr())
         return cam
 

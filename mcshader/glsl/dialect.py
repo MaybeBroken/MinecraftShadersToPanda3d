@@ -273,6 +273,30 @@ def translate_stage(
                 "uniform float mcEntityId;",
                 "vec4 mc_Entity = vec4(mcEntityId, 0.0, 0.0, 1.0);",
             ]
+        # `at_tangent` is the one custom attribute that CAN be fed for real: it is an
+        # ordinary tangent, and Panda3D binds `p3d_Tangent` straight from a vertex
+        # column named "tangent". Leaving it to the generic attribute->in swap declared
+        # `in vec4 at_tangent;` against a column no engine writes, so it read all zeros
+        # and the TBN matrix BSL builds from it
+        # (`cross(at_tangent.xyz, gl_Normal.xyz) * at_tangent.w`) came out degenerate --
+        # which is why ADVANCED_MATERIALS could not be turned on at all: every normal
+        # map would have been rotated by a zero matrix.
+        #
+        # The handedness in `.w` is +1 here, so the binormal is `cross(T, N)`. Geometry
+        # supplying tangents has to match that convention; Panda's own "binormal" column
+        # is not consulted, because BSL derives the binormal itself and using both would
+        # let the two disagree.
+        tangent_decl_re = re.compile(
+            r"^[ \t]*(?:attribute|in)\s+vec4\s+at_tangent\s*;\s*$", re.M
+        )
+        if tangent_decl_re.search(body):
+            body = tangent_decl_re.sub("", body)
+            introduced.append(("p3d_Tangent", "attrib vec3"))
+            # A #define rather than a global initialised from an attribute: GLSL only
+            # allows constant expressions in a global initialiser, and drivers differ on
+            # how much they overlook there.
+            extra_header.append("#define at_tangent vec4(p3d_Tangent, 1.0)")
+
         midtex_decl_re = re.compile(r"^[ \t]*(?:attribute|in)\s+vec4\s+mc_midTexCoord\s*;\s*$", re.M)
         if midtex_decl_re.search(body):
             body = midtex_decl_re.sub("", body)
@@ -298,6 +322,28 @@ def translate_stage(
     # automatically.
     base_tex = "p3d_Texture0" if idx == 0 else "mc_BaseTexture"
     body = re.sub(r"\btexture\b(?!\s*\()", base_tex, body)
+
+    # `tex` and `gtexture` are the other two names Optifine/Iris give that same
+    # bound atlas — `texture` in the gbuffers programs, `tex` in shadow.glsl,
+    # `gtexture` in newer packs. They have to resolve to the base texture too, or
+    # they fall through to the engine's generic "unrecognised sampler" fallback: a
+    # 1x1 opaque black texel. In the shadow program that is not a cosmetic
+    # difference. `shadow.glsl` opens with
+    #     vec4 albedo = texture2D(tex, texCoord.xy);
+    #     if (albedo.a < 0.01) discard;
+    # so a fallback whose alpha is always 1 means the discard can never fire and
+    # every alpha-cut surface — foliage, glass, grates, water — casts the solid
+    # shadow of its whole quad instead of its cut-out shape. It also makes
+    # shadowcolor0 uniformly black, which zeroes BSL's coloured-shadow term and
+    # its water caustics (both are `shadowcolor0 * ...`).
+    #
+    # Renamed only where the source actually declares the name as a sampler, so a
+    # local or field that happens to be called `tex` in some other pack is left
+    # alone. The declaration is renamed along with the uses (the base-texture
+    # input may legally be declared).
+    for alias in ("tex", "gtexture"):
+        if re.search(rf"^[ \t]*uniform\s+sampler2D\s+{alias}\s*;\s*$", body, re.M):
+            body = re.sub(rf"\b{alias}\b", base_tex, body)
 
     # 5. Fragment outputs: gl_FragColor / gl_FragData[n] -> declared outs.
     frag_outs: list[str] = []

@@ -32,12 +32,19 @@ class ProgramSource:
 
 class ShaderPack:
     def __init__(self, files: dict[str, str], *, name: str = "shaderpack",
-                 base_dir: str | None = None):
+                 base_dir: str | None = None, zip_path: str | None = None,
+                 zip_prefix: str = ""):
         #: relative-path -> text, relative to the shaders root.
         self.files = files
         self.name = name
         #: filesystem root when loaded from a directory (enables disk includes).
         self.base_dir = base_dir
+        #: the .zip this came from, and the prefix that ends at its shaders root,
+        #: so binary assets (see `read_bytes`) can be pulled out on demand. Only
+        #: text is slurped up front; a pack's textures can be megabytes and most
+        #: callers never want them.
+        self._zip_path = zip_path
+        self._zip_prefix = zip_prefix
 
     # -- construction ----------------------------------------------------
     @classmethod
@@ -100,7 +107,8 @@ class ShaderPack:
                     files[key] = zf.read(name).decode("utf-8")
                 except (KeyError, UnicodeDecodeError):
                     continue
-        return cls(files, name=os.path.splitext(os.path.basename(path))[0])
+        return cls(files, name=os.path.splitext(os.path.basename(path))[0],
+                   zip_path=path, zip_prefix=prefix)
 
     # -- enumeration -----------------------------------------------------
     def programs(self) -> list[str]:
@@ -131,6 +139,30 @@ class ShaderPack:
     def read_text(self, relpath: str) -> str | None:
         """Return the text of a pack file (relative to the shaders root)."""
         return self.files.get(relpath)
+
+    def read_bytes(self, relpath: str) -> bytes | None:
+        """Return the raw bytes of a pack file, or None if it isn't there.
+
+        For the pack's own *asset* files — the noise and lens-dirt textures a
+        pack ships under ``tex/`` and names in ``shaders.properties`` — which
+        never go through the text file map (they aren't UTF-8, and slurping
+        every one of them up front would cost megabytes nobody asked for).
+        """
+        relpath = relpath.replace("\\", "/").lstrip("/")
+        if self.base_dir is not None:
+            full = os.path.join(self.base_dir, *relpath.split("/"))
+            try:
+                with open(full, "rb") as fh:
+                    return fh.read()
+            except OSError:
+                return None
+        if self._zip_path is not None:
+            try:
+                with zipfile.ZipFile(self._zip_path) as zf:
+                    return zf.read(self._zip_prefix + relpath)
+            except (OSError, KeyError, zipfile.BadZipFile):
+                return None
+        return None
 
     def properties(self, values: dict[str, object] | None = None):
         """Parse ``shaders.properties`` (empty :class:`Properties` if absent).

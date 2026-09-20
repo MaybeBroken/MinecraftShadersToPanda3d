@@ -65,6 +65,36 @@ class PipelineRenderer:
 
         return BitMask32.bit(7)
 
+    @staticmethod
+    def _shadow_opaque_bit() -> Any:
+        """Draw-mask bit for the *opaque-only* shadow camera — the one that
+        fills ``shadowtex1`` (see `_build_shadow_pass`).
+
+        Minecraft packs get two shadow depth maps, and the difference between
+        them is the whole mechanism for light that passes *through* something:
+        ``shadowtex0`` holds every caster, ``shadowtex1`` only the opaque ones.
+        A pixel that is occluded in 0 but clear in 1 has water or stained glass
+        over it, and BSL tints it with ``shadowcolor0`` instead of blacking it
+        out — which is also exactly how it draws water caustics
+        (``SampleBasicShadow``/``SampleShadow`` both gate the coloured term on
+        ``texture2DShadow(shadowtex1, ...)``).
+
+        Binding one depth map to both samplers, as this did before, makes that
+        difference identically zero: every translucent caster reads as solidly
+        opaque, so water casts a flat black shadow and no caustic ever reaches
+        the floor of a pool.
+        """
+        from panda3d.core import BitMask32
+
+        return BitMask32.bit(6)
+
+    #: Render-type substrings whose geometry is *translucent* rather than
+    #: alpha-cut, and so is excluded from the opaque shadow map. Alpha-cut
+    #: geometry (foliage, grates) must stay in it: it occludes completely
+    #: wherever it occludes at all, and shadow.glsl's own `discard` already
+    #: handles its holes.
+    _TRANSLUCENT_TYPES = ("water",)
+
     def __init__(self, base: Any, pack_path: str, *, world: str = "world0",
                  profile: str | None = None, target: str = "panda3d"):
         # Panda3D pads every render-to-texture target up to the next power of
@@ -85,6 +115,8 @@ class PipelineRenderer:
         self.world = world
         self.target = target
         self._geometry: list[tuple[Any, str]] = []  # (nodepath, render_type)
+        #: 0 in air, 1 under water, 2 in lava; see `set_eye_in_water`.
+        self.eye_in_water = 0
         self._quads: list[Any] = []
         self._final_quads: list[Any] = []  # subset of _quads that cover the window
         self._colortex: dict[int, Any] = {}
@@ -180,6 +212,22 @@ class PipelineRenderer:
         # Set unconditionally — independent of `_enabled`, which only toggles
         # the *visible* shading, while the offscreen chain keeps running.
         nodepath.set_tag(self._SHADOW_TAG, self._SHADOW_TAG_VALUE)
+        # Translucent geometry casts into shadowtex0 but must stay out of
+        # shadowtex1, or the pack cannot tell "light passed through something
+        # coloured" from "light was blocked" — see `_shadow_opaque_bit`.
+        hidden = getattr(self, "_shadow_translucent", None)
+        if hidden is None:
+            hidden = self._shadow_translucent = []
+        if any(word in render_type for word in self._TRANSLUCENT_TYPES):
+            nodepath.hide(self._shadow_opaque_bit())
+            hidden.append(nodepath)
+        elif any(np == nodepath for np in hidden):
+            # Only un-hide what *this* put in the opaque camera's blind spot. An
+            # unconditional show() would also reveal the sky dome, which
+            # `build_sky` hides from both shadow cameras and which
+            # `set_render_type` is replayed over on every recompile.
+            nodepath.show(self._shadow_opaque_bit())
+            self._shadow_translucent = [np for np in hidden if np != nodepath]
         self._geometry.append((nodepath, render_type))
         # Respect a standing set_enabled(False): re-tagging (a rebuild after
         # an option change, a swap_pack() replay) must not silently re-shade
@@ -245,6 +293,81 @@ class PipelineRenderer:
         nodepath.set_shader_input(
             "mcLightmap", LVecBase2(float(block_light), float(sky_light)))
 
+    def set_eye_in_water(self, state: int) -> None:
+        """Tell the pack whether the camera is under water (1), lava (2) or in air (0).
+
+        An engine has to drive this itself: the pack cannot work it out, and every
+        underwater effect it has is switched off until something does.
+        """
+        self.eye_in_water = int(state)
+
+    def set_eye_brightness(self, block_light: float, sky_light: float,
+                           *, immediate: bool = False) -> None:
+        """How lit the spot the *camera* occupies is, as (block, sky) in 0..1.
+
+        Minecraft's ``eyeBrightness``, and the eased ``eyeBrightnessSmooth`` the
+        pack actually reads almost everywhere (BSL derives ``eBS =
+        eyeBrightnessSmooth.y / 240.0`` in nineteen of its files). It is not the
+        same thing as a surface's lightmap: it describes where the *viewer* is,
+        and the pack uses it to decide how much of the sun reaches the air around
+        them — the strength of the fog, the tint of water fog seen from
+        underwater, the sky's contribution to ambient.
+
+        Zero is not a neutral default for it. At ``sky = 0`` BSL's water fog tint
+        collapses to near-black, so a submerged camera sees no water at all, just
+        a dimming; the generic unbound-uniform zero was doing exactly that. An
+        engine that never calls this is treated as outdoors under open sky.
+
+        ``immediate`` snaps the smoothed value instead of easing into it — for a
+        teleport, where easing would drag the old lighting across the cut.
+        """
+        self._eye_brightness = (max(0.0, min(1.0, block_light)),
+                                max(0.0, min(1.0, sky_light)))
+        if immediate or getattr(self, "_eye_brightness_smooth", None) is None:
+            self._eye_brightness_smooth = self._eye_brightness
+
+    #: Seconds for `eyeBrightnessSmooth` to cover most of a step change. Minecraft
+    #: eases this over roughly a second; the point is that walking out of a doorway
+    #: must not switch the fog and the water's colour in a single frame.
+    _EYE_BRIGHTNESS_EASE = 0.6
+
+    def _eye_brightness_uniforms(self, dt: float) -> dict[str, Any]:
+        from panda3d.core import LVecBase2i
+
+        target = getattr(self, "_eye_brightness", (0.0, 1.0))
+        smooth = getattr(self, "_eye_brightness_smooth", None) or target
+        # Frame-rate independent exponential ease, so the fog settles at the same
+        # rate whether the scene is running at 20fps or 200.
+        k = 1.0 - pow(0.01, max(dt, 0.0) / self._EYE_BRIGHTNESS_EASE)
+        smooth = tuple(smooth[i] + (target[i] - smooth[i]) * k for i in range(2))
+        self._eye_brightness_smooth = smooth
+        return {
+            "eyeBrightness": LVecBase2i(int(target[0] * 240.0), int(target[1] * 240.0)),
+            "eyeBrightnessSmooth": LVecBase2i(int(smooth[0] * 240.0),
+                                              int(smooth[1] * 240.0)),
+        }
+
+    def set_material_maps(self, nodepath: Any, normal: Any = None,
+                          specular: Any = None) -> None:
+        """Give ``nodepath`` its own PBR maps, in the pack's labPBR convention.
+
+        ``normal`` is sampled as RG = tangent-space normal XY (``*2-1``), B = ambient
+        occlusion, A = height for parallax; ``specular`` as R = perceptual smoothness,
+        G = F0 (>= 0.9 reads as metal), B = porosity below 0.251 and subsurface above
+        it, A = emission (1.0 meaning *none*). See ``lib/surface/materialGbuffers.glsl``.
+
+        These are ordinary shader inputs, so they inherit down the graph and a node set
+        here overrides whatever its parent was given. Feeding them only does anything
+        with ``ADVANCED_MATERIALS`` enabled on the pack -- without it the programs never
+        declare the samplers at all -- and that in turn needs geometry carrying real
+        tangents, since BSL builds its TBN from ``at_tangent`` (see the dialect's
+        synthesis of it from ``p3d_Tangent``).
+        """
+        if normal is not None:
+            nodepath.set_shader_input("normals", normal)
+        if specular is not None:
+            nodepath.set_shader_input("specular", specular)
+
     def clear(self, nodepath: Any) -> None:
         nodepath.clear_shader()
         nodepath.clear_tag(self._SHADOW_TAG)
@@ -294,6 +417,7 @@ class PipelineRenderer:
         # sky albedo); a dedicated draw-mask bit hides it from that camera
         # only, leaving it visible to the main (all-on mask) camera.
         sky.hide(self._shadow_draw_bit())
+        sky.hide(self._shadow_opaque_bit())
         self._sky_np = sky
         return sky
 
@@ -845,6 +969,66 @@ class PipelineRenderer:
         self._shadow_cam.look_at(center, self._safe_up(-sun_panda))
         dr = self._shadow_buf.make_display_region()
         dr.set_camera(self._shadow_cam)
+        self._build_opaque_shadow_pass(shadow_shader, lens, res, win)
+
+    def _build_opaque_shadow_pass(self, shadow_shader: Any, lens: Any,
+                                  res: int, win: Any) -> None:
+        """The second shadow depth map: opaque casters only (``shadowtex1``).
+
+        See `_shadow_opaque_bit` for why the pack needs two. This is a depth-only
+        buffer — ``shadowcolor`` comes from the first pass, which draws
+        everything — rendered by a camera that shares the first one's *lens
+        object* and hangs off its NodePath, so the two views cannot drift apart:
+        one transform, set once per frame in `_dynamic_uniforms`, drives both.
+        Any node the pack marked translucent is hidden from this camera's draw
+        mask, so it writes no depth here while still writing it next door.
+
+        Skipped entirely when the pack never samples ``shadowtex1`` — there is no
+        point paying for a second pass nothing reads.
+        """
+        from panda3d.core import (Camera, FrameBufferProperties, GraphicsOutput,
+                                  GraphicsPipe, RenderState, ShaderAttrib, Texture,
+                                  WindowProperties)
+
+        self._shadow_opaque_tex = None
+        self._shadow_cam_opaque = None
+        if "shadowtex1" not in self._sampler_names:
+            return
+
+        fb = FrameBufferProperties()
+        fb.set_depth_bits(24)
+        buf = self.base.graphicsEngine.make_output(
+            win.get_pipe(), "mcshader-shadow-opaque", -201, fb,
+            WindowProperties.size(res, res), GraphicsPipe.BF_refuse_window,
+            win.get_gsg(), win)
+        if buf is None:
+            return
+        tex = Texture("mcshader-shadow-opaque-depth")
+        tex.set_wrap_u(Texture.WM_border_color)
+        tex.set_wrap_v(Texture.WM_border_color)
+        tex.set_border_color((1, 1, 1, 1))  # outside the frustum = lit
+        tex.set_minfilter(Texture.FT_shadow)
+        tex.set_magfilter(Texture.FT_shadow)
+        buf.add_render_texture(tex, GraphicsOutput.RTM_bind_or_copy,
+                               GraphicsOutput.RTP_depth)
+        self._buffers.append(buf)
+        self._shadow_opaque_buf = buf
+        self._shadow_opaque_tex = tex
+
+        cam = Camera("mcshader-shadow-cam-opaque", lens)
+        cam.set_tag_state_key(self._SHADOW_TAG)
+        cam.set_tag_state(self._SHADOW_TAG_VALUE,
+                          RenderState.make(ShaderAttrib.make(shadow_shader)))
+        cam.set_initial_state(RenderState.make(ShaderAttrib.make(shadow_shader)))
+        cam.set_camera_mask(self._shadow_opaque_bit())
+        # Parented to the first shadow camera rather than placed alongside it:
+        # an identity local transform means it inherits that pose exactly, every
+        # frame, with no second update to keep in sync.
+        self._shadow_cam_opaque = self._shadow_cam.attach_new_node(cam)
+        sky_np = getattr(self, "_sky_np", None)
+        if sky_np is not None:
+            sky_np.hide(self._shadow_opaque_bit())
+        buf.make_display_region().set_camera(self._shadow_cam_opaque)
 
     # -- fullscreen chain -----------------------------------------------
     _COLORTEX_REF_RE = re.compile(r"\bcolortex(\d+)\b")
@@ -1107,6 +1291,68 @@ void main() {
             self._fallback_normal = tex
         return self._fallback_normal
 
+    def _pack_texture(self, sampler: str) -> Any:
+        """The image the pack ships for one named sampler (``texture.<name>=``).
+
+        OptiFine/Iris packs declare their own auxiliary images in
+        ``shaders.properties`` — BSL's is ``texture.noise=tex/noise.png``, a 512²
+        tiling RGBA noise field. Left unbound, ``noisetex`` fell through to the
+        generic 1x1 black fallback, and *every* effect the pack drives from noise
+        silently produced nothing: water had no wave height (``GetWaterHeightMap``
+        is a pure noise lookup, so the surface came out mirror-flat), the shadow
+        pass had no caustics to project, clouds had no coverage field, and the
+        rain puddles and dithered sampling in composite had no jitter.
+
+        A pack that ships none gets generated value noise rather than the black
+        texel, because "no noise data" is never a meaningful zero here — it is the
+        one input that must vary. Cached per sampler name; the image is decoded
+        once and survives recompiles.
+        """
+        cache = getattr(self, "_pack_textures", None)
+        if cache is None:
+            cache = self._pack_textures = {}
+        if sampler in cache:
+            return cache[sampler]
+
+        from panda3d.core import PNMImage, StringStream, Texture
+
+        tex = None
+        relpath = self.props.raw.get(f"texture.{sampler}")
+        data = self.pack.read_bytes(relpath) if relpath else None
+        if data:
+            image = PNMImage()
+            if image.read(StringStream(data)):
+                tex = Texture(f"mcshader-{sampler}")
+                tex.load(image)
+        if tex is None:
+            tex = self._generated_noise_tex(sampler)
+        # Tiling is the whole point: the pack scales these coordinates by the
+        # world position, far outside [0,1].
+        tex.set_wrap_u(Texture.WM_repeat)
+        tex.set_wrap_v(Texture.WM_repeat)
+        tex.set_minfilter(Texture.FT_linear)
+        tex.set_magfilter(Texture.FT_linear)
+        cache[sampler] = tex
+        return tex
+
+    @staticmethod
+    def _generated_noise_tex(name: str) -> Any:
+        """A tiling RGBA value-noise image, for a pack that ships none.
+
+        Four independent channels, because packs read them separately (BSL takes
+        cloud coverage from ``.r``, water height from ``.g`` and ``.a``).
+        """
+        import random
+
+        from panda3d.core import Texture
+
+        size = 256
+        rng = random.Random(0x9E3779B9)
+        tex = Texture(f"mcshader-{name}-generated")
+        tex.setup_2d_texture(size, size, Texture.T_unsigned_byte, Texture.F_rgba)
+        tex.set_ram_image(bytes(rng.getrandbits(8) for _ in range(size * size * 4)))
+        return tex
+
     def _bind_inputs(self, node: Any, *, is_quad: bool = False) -> None:
         """Bind every sampler the shaders declare (colortex/shadow/fallback)."""
         bound: set[str] = set()
@@ -1122,8 +1368,12 @@ void main() {
         for alias, idx in aliases.items():
             bind(alias, self._colortex.get(idx, self._fallback_tex()))
         shadow_depth = getattr(self, "_shadow_tex", None) or self._fallback_tex()
-        for s in ("shadowtex0", "shadowtex1"):
-            bind(s, shadow_depth)
+        bind("shadowtex0", shadow_depth)
+        # shadowtex1 is the opaque-only depth map, not a second name for the
+        # same image — see `_shadow_opaque_bit`. It falls back to shadowtex0
+        # only when that pass could not be built, which is the old (wrong but
+        # harmless-looking) behaviour rather than a black texture.
+        bind("shadowtex1", getattr(self, "_shadow_opaque_tex", None) or shadow_depth)
         # shadowcolor0/1 are plain (non depth-compare) sampler2D uniforms that
         # hold the shadow pass's rendered albedo (colored/translucent shadow
         # casting). Binding them to the SAME Texture object as shadowtex0/1
@@ -1152,7 +1402,7 @@ void main() {
         depth_tex = getattr(self, "_depth_tex", None)
         for s in ("depthtex0", "depthtex1", "depthtex2"):
             bind(s, depth_tex if depth_tex is not None else self._opaque_white_tex())
-        bind("noisetex", self._fallback_tex())
+        bind("noisetex", self._pack_texture("noise"))
         # A fullscreen quad has no model texture; give its base sampler colortex0.
         if is_quad:
             bind("p3d_Texture0", self._colortex.get(0, self._fallback_tex()))
@@ -1166,10 +1416,30 @@ void main() {
                 node.set_shader_input(name, fallback)
 
     # -- per-frame uniforms ---------------------------------------------
+    #: Task sort for the per-frame uniform update. It has to be the *last* thing
+    #: before the draw, because everything it computes describes the camera:
+    #: gbufferModelView/Projection, shadowModelView/Projection, cameraPosition,
+    #: and the shadow camera's own pose (which is re-aimed at the player every
+    #: frame). Panda runs igLoop — the draw — at sort 50, and an application's
+    #: own tasks default to sort 0; so at sort 0 this ran *before* the input,
+    #: world and physics tasks that actually move the camera, and the frame was
+    #: then drawn from a pose none of those uniforms described.
+    #:
+    #: Being one frame stale is invisible while standing still and wrong in
+    #: proportion to speed while moving: GetShadow reconstructs each pixel's
+    #: shadow-space position with last frame's matrices and samples a shadow map
+    #: rendered from last frame's centre, so shadows slide against the geometry
+    #: casting them and snap back the moment the camera stops. The same staleness
+    #: runs through every screen-space effect that unprojects depth (AO,
+    #: reflections, light shafts, water fog) and through TAA's reprojection,
+    #: which is handed a "previous" matrix that is really the current one.
+    _UNIFORM_TASK_SORT = 49
+
     def _ensure_task(self) -> None:
         if self._task_started or self.base is None:
             return
-        self.base.taskMgr.add(self._update, "mcshader-pipeline-uniforms")
+        self.base.taskMgr.add(self._update, "mcshader-pipeline-uniforms",
+                              sort=self._UNIFORM_TASK_SORT)
         self._task_started = True
 
     #: Real seconds per in-game day, driving worldTime (and everything derived
@@ -1372,6 +1642,14 @@ void main() {
             "viewWidth": w, "viewHeight": h, "aspectRatio": w / max(h, 1.0),
             "near": lens.get_near(), "far": lens.get_far(),
             **day, "rainStrength": 0.0, "wetness": 0.0,
+            # 0 in air, 1 submerged in water, 2 in lava. Every submerged effect a pack
+            # has is gated on this -- the water fog, the underwater distortion, the
+            # light shafts through water, and the side of the water surface its fresnel
+            # is computed for. Left unfed it defaults to zero, which is not "unknown" but
+            # a positive claim that the camera is never in water, so none of that code
+            # can ever run. See `set_eye_in_water`.
+            "isEyeInWater": int(self.eye_in_water),
+            **self._eye_brightness_uniforms(clock.get_dt()),
             "cameraPosition": camera_position_mc, "previousCameraPosition": prev_camera_position_mc,
             "gbufferModelView": gbuffer_mv, "gbufferModelViewInverse": gbuffer_mv_inv,
             "gbufferPreviousModelView": prev_gbuffer_mv,
