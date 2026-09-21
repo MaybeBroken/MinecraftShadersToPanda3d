@@ -300,16 +300,38 @@ def translate_stage(
         midtex_decl_re = re.compile(r"^[ \t]*(?:attribute|in)\s+vec4\s+mc_midTexCoord\s*;\s*$", re.M)
         if midtex_decl_re.search(body):
             body = midtex_decl_re.sub("", body)
-            # Equal to the live texcoord (not a real face midpoint), so any
-            # `texCoord.t < mc_midTexCoord.t` "top half only" split BSL makes
-            # (e.g. tall-grass-only-sways-at-the-top) resolves to "whole mesh
-            # sways" instead — an honest approximation, not a real midpoint.
+            # Equal to the live texcoord, which is NOT a real face midpoint.
+            #
+            # Packs use mc_midTexCoord to recover the bounds of the one atlas tile a
+            # face was cut from, so parallax can march inside it without bleeding into
+            # the neighbouring sprite. BSL does (gbuffers_terrain.glsl):
+            #     texMinMidCoord = texCoord - midCoord
+            #     vTexCoordAM.pq = abs(texMinMidCoord) * 2      // tile size
+            #     vTexCoordAM.st = min(texCoord, midCoord - texMinMidCoord)
+            #     vTexCoord.xy   = sign(texMinMidCoord) * 0.5 + 0.5
+            # That only works when a quad's UVs span exactly one tile and the midpoint
+            # is its centre, so the per-vertex 0/1 in vTexCoord interpolates into a
+            # local coordinate across the face. An engine feeding world-derived,
+            # many-times-repeating UVs has no such tile, and no value of this attribute
+            # can manufacture one: offsetting by half a tile (tried, and reverted) makes
+            # the size come out right but leaves the march wrapping through whole tiles
+            # at grazing angles, which warps the surface badly.
+            #
+            # So this stays equal to the texcoord, giving tile size zero. That makes
+            # parallax a no-op rather than a mess -- and packs skip it anyway for
+            # geometry with no block id, which is this engine's default. Real parallax
+            # needs per-quad tile UVs plus a genuine midpoint attribute from the engine.
+            #
+            # The `texCoord.t < mc_midTexCoord.t` "top half only" split packs use for
+            # waving vegetation resolves to false, so those meshes sway as a whole --
+            # an honest approximation, not a real midpoint.
             # Force the texcoord attribute's own declaration to exist even if
             # this particular source never separately referenced
             # gl_MultiTexCoord0 itself (in practice it always does, but this
             # keeps the synthesis self-contained rather than order-dependent).
             introduced.append((texcoord_attr, "attrib vec2"))
-            extra_header.append(f"vec4 mc_midTexCoord = vec4({texcoord_attr}, 0.0, 1.0);")
+            extra_header.append(
+                f"vec4 mc_midTexCoord = vec4({texcoord_attr}, 0.0, 1.0);")
 
     # 4. Texture function renames.
     body = _word_sub(body, _TEX_FUNCS)

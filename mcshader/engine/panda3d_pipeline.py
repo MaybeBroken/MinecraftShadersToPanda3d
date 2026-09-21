@@ -88,6 +88,18 @@ class PipelineRenderer:
 
         return BitMask32.bit(6)
 
+    #: What `mc_Entity.x` is for geometry the caller gave no block id.
+    #:
+    #: Zero is Minecraft's "this is not a block" sentinel, and packs branch on it --
+    #: BSL's gbuffers_terrain does `if (mc_Entity.x == 0) viewVector /= 0.0;`, poisoning
+    #: the tangent-space view vector with NaN so parallax mapping skips the surface.
+    #: Raising this to 1 does switch parallax back on for untagged geometry, but the
+    #: pack's parallax also needs per-quad atlas-tile UVs that this engine does not
+    #: produce (see the `mc_midTexCoord` note in glsl/dialect.py), and with
+    #: world-derived repeating UVs the result is badly warped rather than merely
+    #: unconvincing. Left at zero, so the pack's own skip is what disables it.
+    _DEFAULT_ENTITY_ID = 0
+
     #: Render-type substrings whose geometry is *translucent* rather than
     #: alpha-cut, and so is excluded from the opaque shadow map. Alpha-cut
     #: geometry (foliage, grates) must stay in it: it occludes completely
@@ -202,7 +214,7 @@ class PipelineRenderer:
                 f"pack {self.pack.name!r} has no program for render type "
                 f"{render_type!r}; available: {self.resolver.types()}"
             )
-        nodepath.set_shader_input("mcEntityId", 0)
+        nodepath.set_shader_input("mcEntityId", self._DEFAULT_ENTITY_ID)
         # Minecraft's per-vertex lightmap (block light, sky light). Engine
         # geometry has no such vertex column, so it's a per-object uniform;
         # default to "outdoors under open sky" — see `set_lightmap`.
@@ -220,6 +232,9 @@ class PipelineRenderer:
             hidden = self._shadow_translucent = []
         if any(word in render_type for word in self._TRANSLUCENT_TYPES):
             nodepath.hide(self._shadow_opaque_bit())
+            # ...and out of the opaque depth buffer, for the same reason one step
+            # nearer the camera: see `_build_opaque_depth_target`.
+            nodepath.hide(self._opaque_depth_bit())
             hidden.append(nodepath)
         elif any(np == nodepath for np in hidden):
             # Only un-hide what *this* put in the opaque camera's blind spot. An
@@ -227,6 +242,7 @@ class PipelineRenderer:
             # `build_sky` hides from both shadow cameras and which
             # `set_render_type` is replayed over on every recompile.
             nodepath.show(self._shadow_opaque_bit())
+            nodepath.show(self._opaque_depth_bit())
             self._shadow_translucent = [np for np in hidden if np != nodepath]
         self._geometry.append((nodepath, render_type))
         # Respect a standing set_enabled(False): re-tagging (a rebuild after
@@ -716,6 +732,77 @@ class PipelineRenderer:
         self._depth_tex = depth
         dr = self._scene_buf.make_display_region()
         dr.set_camera(self.base.cam)
+        self._build_opaque_depth_target()
+
+    @staticmethod
+    def _opaque_depth_bit() -> Any:
+        """Draw-mask bit for the opaque-only depth camera (``depthtex1``)."""
+        from panda3d.core import BitMask32
+
+        return BitMask32.bit(5)
+
+    def _build_opaque_depth_target(self) -> None:
+        """A second depth buffer with the translucent geometry left out.
+
+        Minecraft gives a pack three depth textures that differ by what is *missing*
+        from them: ``depthtex0`` has everything, ``depthtex1`` has no translucents,
+        ``depthtex2`` neither translucents nor the held item. Binding one buffer to all
+        three looks harmless and is not, because the pack's water is itself translucent
+        and reads ``depthtex1`` to answer two questions about what lies *behind* it:
+
+        * ``SimpleReflection`` (lib/reflections/simpleReflections.glsl) screen-space
+          raytraces against it. Starting a reflection ray on the water surface and
+          marching it through a depth buffer that contains that same surface makes it
+          collide with itself within a step or two, and the reflection degenerates into
+          blocks of whatever the first hit happened to be -- the "pixelated reflections".
+        * ``gbuffers_water`` takes ``opaqueDepth`` from it and subtracts, to get how much
+          water the view ray passes through, which drives the depth-tinting and the
+          refraction. Aliased, that difference is zero everywhere and the water is
+          uniformly thin no matter how deep it is.
+
+        Depth only, no colour: nothing samples its colour, and the fragment cost of a
+        depth-only pass over the opaque scene is small. The camera shares the player
+        camera's lens object and hangs off its NodePath at identity, so it cannot drift
+        out of step with the view it is supposed to describe.
+        """
+        from panda3d.core import (Camera, FrameBufferProperties, GraphicsOutput,
+                                  GraphicsPipe, Texture, WindowProperties)
+
+        self._opaque_depth_tex = None
+        self._opaque_depth_cam = None
+        if not ({"depthtex1", "depthtex2"} & self._sampler_names):
+            return
+        win = self.base.win
+        if win is None or self.base.cam is None:
+            return
+
+        size = (win.get_x_size(), win.get_y_size())
+        fb = FrameBufferProperties()
+        fb.set_depth_bits(24)
+        buf = self.base.graphicsEngine.make_output(
+            win.get_pipe(), "mcshader-opaque-depth", -150, fb,
+            WindowProperties.size(*size), GraphicsPipe.BF_refuse_window,
+            win.get_gsg(), win)
+        if buf is None:
+            return
+        tex = Texture("mcshader-opaque-depth")
+        tex.set_wrap_u(Texture.WM_clamp)
+        tex.set_wrap_v(Texture.WM_clamp)
+        tex.set_minfilter(Texture.FT_nearest)
+        tex.set_magfilter(Texture.FT_nearest)
+        buf.add_render_texture(tex, GraphicsOutput.RTM_bind_or_copy,
+                               GraphicsOutput.RTP_depth)
+        self._buffers.append(buf)
+        self._opaque_depth_buf = buf
+        self._opaque_depth_tex = tex
+
+        cam = Camera("mcshader-opaque-depth-cam", self.base.cam.node().get_lens())
+        cam.set_camera_mask(self._opaque_depth_bit())
+        self._opaque_depth_cam = self.base.cam.attach_new_node(cam)
+        sky_np = getattr(self, "_sky_np", None)
+        if sky_np is not None:
+            sky_np.hide(self._opaque_depth_bit())
+        buf.make_display_region().set_camera(self._opaque_depth_cam)
 
     def _sun_direction(self, time_angle: float = 0.25) -> Any:
         """Direction from the scene toward the sun, at a given ``timeAngle``
@@ -1400,8 +1487,17 @@ void main() {
         # is the near plane, i.e. "a surface pressed against the camera",
         # which reads as fully occluded everywhere.
         depth_tex = getattr(self, "_depth_tex", None)
-        for s in ("depthtex0", "depthtex1", "depthtex2"):
-            bind(s, depth_tex if depth_tex is not None else self._opaque_white_tex())
+        if depth_tex is None:
+            depth_tex = self._opaque_white_tex()
+        bind("depthtex0", depth_tex)
+        # depthtex1/2 exclude the translucents; see `_build_opaque_depth_target` for
+        # what reads the difference and what goes wrong when there isn't one. They fall
+        # back to depthtex0 only if that pass could not be built.
+        opaque_depth = getattr(self, "_opaque_depth_tex", None) or depth_tex
+        bind("depthtex1", opaque_depth)
+        # depthtex2 additionally drops the held item, which this engine has no notion
+        # of, so it is the same image.
+        bind("depthtex2", opaque_depth)
         bind("noisetex", self._pack_texture("noise"))
         # A fullscreen quad has no model texture; give its base sampler colortex0.
         if is_quad:
@@ -1445,7 +1541,7 @@ void main() {
     #: Real seconds per in-game day, driving worldTime (and everything derived
     #: from it — sun position, sky colour, shadowFade) so lighting actually
     #: changes instead of sitting at whatever a single fixed constant gave it.
-    _DAY_LENGTH_SECONDS = 120.0
+    _DAY_LENGTH_SECONDS = 60*12 #12 minutes irl time
 
     def _day_cycle_uniforms(self, t: float, frame_count: int) -> dict[str, Any]:
         """The handful of ``shaders.properties`` custom uniforms BSL actually
