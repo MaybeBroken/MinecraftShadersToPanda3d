@@ -440,6 +440,10 @@ class PipelineRenderer:
     # -- build / teardown -----------------------------------------------
     def _build(self) -> None:
         self._uniform_types: dict[str, str] = {}   # non-sampler uniforms -> glsl type
+        #: Last value pushed for each of the above, so `_update` can skip the ones
+        #: that did not move. Dropped whenever the pipeline is torn down, because
+        #: the quads it was written to do not survive that.
+        self._uniform_cache: dict[str, Any] = {}
         self._sampler_names: set[str] = set()       # every declared sampler name
         self._fallback = None
         self._fallback_normal = None
@@ -500,6 +504,9 @@ class PipelineRenderer:
             self._shadow_cam = None
         self._quads.clear()
         self._final_quads.clear()
+        # These uniforms were pushed to nodes that no longer exist, so nothing
+        # may be skipped on the grounds that it was already set.
+        self._uniform_cache.clear()
         self._colortex.clear()
         self._colortex_back.clear()
         self._buffers = []
@@ -914,7 +921,8 @@ class PipelineRenderer:
 
     def _build_shadow_pass(self) -> None:
         from panda3d.core import (Camera, OrthographicLens, NodePath, GraphicsOutput,
-                                  FrameBufferProperties, GraphicsPipe, WindowProperties)
+                                  FrameBufferProperties, GraphicsPipe, WindowProperties,
+                                  CullFaceAttrib)
 
         shadow_shader = self._compile("shadow", mode="gbuffer")
         if shadow_shader is None:
@@ -1014,13 +1022,23 @@ class PipelineRenderer:
         # matching state *after* the node's own, so the shadow program wins
         # while every shader input (samplers bound on render, mcEntityId on
         # the node) is preserved — confirmed by direct readback.
+        # No back-face culling in the shadow pass, whatever the geometry asks for.
+        # A shadow map is a question about occlusion, not about what faces the
+        # viewer, and an engine whose world is built from single-sided surfaces --
+        # a floor is one quad, not a slab -- has nothing front-facing to the sun
+        # above a room's ceiling. Culled, such a ceiling casts no shadow at all and
+        # daylight pours through a solid roof. Rendering both faces here costs one
+        # extra rasterised triangle per quad in a pass that is depth-only, and it
+        # is what lets the *main* pass cull normally.
+        _shadow_cull = CullFaceAttrib.make(CullFaceAttrib.M_cull_none)
         cam.set_tag_state_key(self._SHADOW_TAG)
         cam.set_tag_state(self._SHADOW_TAG_VALUE,
-                          RenderState.make(ShaderAttrib.make(shadow_shader)))
+                          RenderState.make(ShaderAttrib.make(shadow_shader),
+                                           _shadow_cull))
         # Still the fallback for geometry that carries no render-type tag
         # (untagged props should cast a shadow like anything else).
         cam.set_initial_state(
-            RenderState.make(ShaderAttrib.make(shadow_shader)))
+            RenderState.make(ShaderAttrib.make(shadow_shader), _shadow_cull))
         # A dedicated draw-mask bit lets individual nodes opt out of the
         # shadow pass without disappearing from the main camera (whose mask
         # is all-on): `np.hide(_SHADOW_DRAW_BIT)` clears just this bit. Used
@@ -1073,9 +1091,9 @@ class PipelineRenderer:
         Skipped entirely when the pack never samples ``shadowtex1`` — there is no
         point paying for a second pass nothing reads.
         """
-        from panda3d.core import (Camera, FrameBufferProperties, GraphicsOutput,
-                                  GraphicsPipe, RenderState, ShaderAttrib, Texture,
-                                  WindowProperties)
+        from panda3d.core import (Camera, CullFaceAttrib, FrameBufferProperties,
+                                  GraphicsOutput, GraphicsPipe, RenderState,
+                                  ShaderAttrib, Texture, WindowProperties)
 
         self._shadow_opaque_tex = None
         self._shadow_cam_opaque = None
@@ -1103,10 +1121,13 @@ class PipelineRenderer:
         self._shadow_opaque_tex = tex
 
         cam = Camera("mcshader-shadow-cam-opaque", lens)
+        _shadow_cull = CullFaceAttrib.make(CullFaceAttrib.M_cull_none)  # see _build_shadow_pass
         cam.set_tag_state_key(self._SHADOW_TAG)
         cam.set_tag_state(self._SHADOW_TAG_VALUE,
-                          RenderState.make(ShaderAttrib.make(shadow_shader)))
-        cam.set_initial_state(RenderState.make(ShaderAttrib.make(shadow_shader)))
+                          RenderState.make(ShaderAttrib.make(shadow_shader),
+                                           _shadow_cull))
+        cam.set_initial_state(RenderState.make(ShaderAttrib.make(shadow_shader),
+                                               _shadow_cull))
         cam.set_camera_mask(self._shadow_opaque_bit())
         # Parented to the first shadow camera rather than placed alongside it:
         # an identity local transform means it inherits that pose exactly, every
@@ -1823,14 +1844,35 @@ void main() {
             # axis, so the dome drifts sideways (and sinks) as the camera
             # climbs, eventually clipping through it.
             sky_np.set_pos(self.base.render, self.base.cam.get_pos(self.base.render))
-        for node in [self.base.render] + self._quads:
-            for name, gtype in self._uniform_types.items():
-                value = dynamic.get(name)
-                if value is None:
-                    value = self._NAMED_DEFAULTS.get(name)
-                if value is None:
-                    value = self._default_for(gtype)
-                node.set_shader_input(name, self._coerce(value, gtype))
+        # Only what actually changed. `set_shader_input` is not a cheap store: each
+        # call replaces the node's ShaderAttrib, and because most of these go on
+        # `render` -- the root of the scene graph -- every one of them invalidates the
+        # composed state of everything below it, so the cull thread re-derives the
+        # whole graph next frame and Panda's state cache fills with garbage to sweep.
+        #
+        # Most of these uniforms never change. Of BSL's 71, the handful that move per
+        # frame are the camera matrices, the clock and the frame counters; the rest are
+        # resolution, toggles, or a default for something this engine does not have.
+        # Pushing all 71 to all 11 targets every frame measured 781 calls and 10-13ms
+        # of the frame, and made `garbageCollectStates` cost another 6-7ms sweeping
+        # what they created. Skipping the unchanged ones takes both to near zero and
+        # leaves the live count of RenderStates flat instead of climbing every frame.
+        targets = [self.base.render] + self._quads
+        cache = self._uniform_cache
+        for name, gtype in self._uniform_types.items():
+            value = dynamic.get(name)
+            if value is None:
+                value = self._NAMED_DEFAULTS.get(name)
+            if value is None:
+                value = self._default_for(gtype)
+            value = self._coerce(value, gtype)
+            if name in cache and cache[name] == value:
+                continue
+            # Stored before the writes, not after, so a value that fails to apply is
+            # not remembered as applied.
+            cache[name] = value
+            for node in targets:
+                node.set_shader_input(name, value)
         return Task.cont
 
     # -- inspection (headless) ------------------------------------------
