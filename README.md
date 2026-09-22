@@ -1,7 +1,7 @@
-# MinecraftShaderDecompiler
+# Minecraft Shader Decompiler
 
-Run a **Minecraft shaderpack's entire deferred pipeline** — shadows, gbuffers,
-deferred lighting, composite chain, final — inside an OpenGL game engine, and
+Run a **Minecraft shaderpack's entire deferred pipeline** (shadows, gbuffers,
+deferred lighting, composite chain, final) inside an OpenGL game engine, and
 re-shade your whole game by swapping the pack.
 
 You tag your objects with Minecraft *render types* (`terrain`, `entity`, …) and
@@ -13,7 +13,7 @@ translation layers are engine-independent.
 
 ## What it looks like
 
-Panda3D's bundled "environment" scene, same camera, same geometry — rendered by
+Panda3D's bundled "environment" scene, same camera, same geometry, rendered by
 Panda3D alone, then by BSL v10 through this pipeline at the `MEDIUM` profile:
 
 | Without | With |
@@ -25,6 +25,7 @@ Panda3D alone, then by BSL v10 through this pipeline at the `MEDIUM` profile:
 ```bash
 pip install ".[panda3d]"
 ```
+OR run the build.py program with the --install flag
 
 ## Demo
 
@@ -64,9 +65,6 @@ nothing is a dead end.
 
 ## Notes
 
-Validated against BSL v10 on Apple M1 / Mesa, OpenGL 4.6 core. Complementary
-Unbound loads and runs. Prefer the `MEDIUM` profile — `HIGH`/`ULTRA` enable TAA,
-which currently renders terrain black. Clouds, compute-shader programs (`.csh`)
-and Distant Horizons are not implemented.
+Validated against BSL v10 on Apple M1 / Mesa, OpenGL 4.6 core. BSL is the only shaderpack confirmed to work, more will be fixed and implemented later
 
 Python 3.10+. MIT licensed.
