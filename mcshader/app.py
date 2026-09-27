@@ -119,7 +119,7 @@ class ShaderApp:
                  profile: str | None = "LOW", world: str = "world0",
                  sky: bool = True, fly: bool = True, speed: float = 40.0,
                  title: str = "mcshader", size: tuple[int, int] | None = None,
-                 vr: Any = None):
+                 vr: Any = None, progress: Any = None, prefs: Any = None):
         self.pack_path = find_pack(pack)
         self.base = base if base is not None else _make_showbase(title, size)
         self._owns_base = base is None
@@ -130,8 +130,15 @@ class ShaderApp:
 
         from .engine import PipelineRenderer
 
+        overrides = None
+        if vr is not None:
+            # Switch the screen-only effects off before the first build, so
+            # the headset connecting only has to rebuild render targets.
+            from .vr import VR_OPTION_OVERRIDES
+            overrides = VR_OPTION_OVERRIDES
         self.pipe = PipelineRenderer(
-            self.base, self.pack_path, world=world, profile=profile)
+            self.base, self.pack_path, world=world, profile=profile,
+            progress=progress, prefs=prefs, option_overrides=overrides)
         #: The procedural sky dome (gradient, sun, moon, stars), or ``None``.
         self.sky = self.pipe.build_sky() if sky else None
         #: The Panda3d-VR bridge when rendering to a headset (see `attach_vr`).
@@ -727,7 +734,12 @@ def init(base: Any = None, pack: str | None = None, **kwargs: Any) -> ShaderApp:
     :func:`find_pack` for where it looks by default). Other keywords go to
     :class:`ShaderApp`: ``profile``, ``world``, ``sky``, ``fly``, ``speed``,
     ``title``, ``size``, ``vr`` (a Panda3d-VR ``VRManager``; see
-    :meth:`ShaderApp.attach_vr`).
+    :meth:`ShaderApp.attach_vr`), ``progress`` (called with a
+    :class:`~mcshader.progress.BuildProgress` per build step, for a loading
+    screen; it stays set as ``app.pipe.progress`` for later recompiles),
+    ``prefs`` (a saved option file applied before the first build, so the pack
+    compiles once; save with ``app.pipe.save_prefs()``, see
+    :mod:`mcshader.config.prefs`).
     """
     # Tolerate init("Shaders/") — the first argument reads as the pack when
     # it's a string, since an engine handle never is one.

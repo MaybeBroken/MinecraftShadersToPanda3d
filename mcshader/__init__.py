@@ -52,6 +52,7 @@ from .pipeline import (
     PipelineGraph, build_graph, RenderTypeResolver, RENDER_TYPES, translate_pass,
 )
 from .decompiler import decompile_program, DecompiledProgram, load_pack
+from .progress import BuildProgress
 
 # -- simple per-object effects (secondary) ------------------------------
 from .registry import ShaderRegistry, default_registry
@@ -68,6 +69,7 @@ __all__ = [
     "PipelineGraph", "build_graph", "RenderTypeResolver", "RENDER_TYPES",
     "translate_pass",
     "decompile_program", "DecompiledProgram",
+    "BuildProgress",
     # simple effects
     "ShaderRegistry", "default_registry",
     "Effect", "EffectParam", "builtin_effects", "BUILTIN_IDS",

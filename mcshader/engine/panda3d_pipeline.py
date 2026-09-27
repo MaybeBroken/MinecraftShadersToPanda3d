@@ -27,13 +27,16 @@ is ``colortex i``, so a translated shader writing ``layout(location=i)`` lands i
 from __future__ import annotations
 
 import re
+from collections import OrderedDict
 from typing import Any
 
 from ..pack.loader import ShaderPack
 from ..config.options import ShaderOptions
+from ..config.prefs import format_prefs, parse_prefs
 from ..pipeline.graph import PipelineGraph, build_graph
 from ..pipeline.rendertypes import RenderTypeResolver
 from ..pipeline.translate import translate_pass
+from ..progress import BuildProgress, ProgressCallback
 
 __all__ = ["PipelineRenderer", "PipelineView"]
 
@@ -179,8 +182,14 @@ class PipelineRenderer:
     #: handles its holes.
     _TRANSLUCENT_TYPES = ("water",)
 
+    #: Translated programs kept for reuse (see `_compile`): a few option sets'
+    #: worth, e.g. with and without the VR overrides.
+    _SHADER_CACHE_SIZE = 128
+
     def __init__(self, base: Any, pack_path: str, *, world: str = "world0",
-                 profile: str | None = None, target: str = "panda3d"):
+                 profile: str | None = None, target: str = "panda3d",
+                 progress: ProgressCallback | None = None, prefs: Any = None,
+                 option_overrides: dict | None = None):
         # Panda3D pads every render-to-texture target up to the next power of
         # two by default (e.g. a 960x540 window -> a 1024x1024 texture, with
         # only the [0,0]-[960,540] corner actually rendered into). Our
@@ -206,13 +215,44 @@ class PipelineRenderer:
         self._task_started = False
         self._enabled = True  # see set_enabled() -- pack-shaded vs. plain rendering
         self.profile_name: str | None = None
-        self.load_pack(pack_path, world=world, profile=profile)
+        #: Called with a `BuildProgress` at each step of every (re)build.
+        self.progress: ProgressCallback | None = progress
+        self._builds = 0
+        self._progress_done = 0
+        self._progress_total = 0
+        self._shader_cache: OrderedDict = OrderedDict()
+        #: The prefs file `save_prefs` writes to by default; see `load_pack`.
+        self.prefs_path = prefs
+        #: What happened to the prefs file on the last `load_pack`, for logs.
+        self.prefs_status = ""
+        #: User values that `option_overrides` replaced before the first
+        #: build, by option name (the VR bridge restores them).
+        self.overridden_options: dict[str, Any] = {}
+        self.load_pack(pack_path, world=world, profile=profile, prefs=prefs,
+                       option_overrides=option_overrides)
 
     # -- pack / options lifecycle ---------------------------------------
     def load_pack(self, pack_path: str, *, world: str | None = None,
-                  profile: str | None = None) -> None:
-        """Load (or reload) a shaderpack and rebuild everything."""
+                  profile: str | None = None, prefs: Any = None,
+                  option_overrides: dict | None = None) -> None:
+        """Load (or reload) a shaderpack and rebuild everything.
+
+        ``prefs`` is a saved option file (see :mod:`mcshader.config.prefs`)
+        applied on top of ``profile`` before building, so the pack compiles
+        once, with those values. A missing file, or one saved for another
+        pack, is skipped; `prefs_status` says which.
+
+        ``option_overrides`` are forced on top of both (the VR bridge passes
+        its screen-only effects); the values they replaced are kept in
+        `overridden_options`.
+        """
+        self._builds += 1
+        # The program count is not known until `_build`, so until then the
+        # events say 0 of 0 rather than the previous build's totals.
+        self._progress_done = self._progress_total = 0
+        self._report("pack", "Reading shaderpack")
         self.pack = ShaderPack.from_path(pack_path)
+        self._shader_cache.clear()  # keyed without the pack
         self.world = world or self.world
         # Bootstrap parse: no option values exist yet, so any `#if` block in
         # shaders.properties resolves with unknown identifiers defaulting
@@ -225,15 +265,58 @@ class PipelineRenderer:
         if profile:
             self.options.apply_profile(profile, self.props)
         self.profile_name = profile
+        if prefs is not None:
+            self._apply_prefs(prefs)
+        if option_overrides:
+            from ..vr import override_options
+
+            self.overridden_options = override_options(self.options, option_overrides)
+            if self.overridden_options:
+                print("[mcshader] VR: switched off screen-only effects: "
+                      + ", ".join(sorted(self.overridden_options)))
         # Re-parse now that real option values exist, so `#if` blocks around
         # `program.*.enabled` (confirmed real: Complementary Unbound gates
         # its shadow program behind `#if SHADOW_QUALITY == -1`) resolve
         # against this pack's actual defaults/profile, not the bootstrap
         # all-falsy guess.
+        self._report("pack", "Resolving pass graph")
         self.props = self.pack.properties(self.options.values())
         self.graph: PipelineGraph = build_graph(self.pack, self.world, self.options.values())
         self.resolver = RenderTypeResolver(self.pack)
-        self._build()
+        self._build(counted=True)
+
+    def _apply_prefs(self, path: Any) -> None:
+        import os
+
+        name = os.path.basename(str(path))
+        try:
+            with open(path, encoding="utf-8") as handle:
+                prefs = parse_prefs(handle.read())
+        except FileNotFoundError:
+            self.prefs_status = f"no shader preferences at {name} yet"
+            return
+        if not prefs.matches(self.pack.name):
+            self.prefs_status = (f"ignoring shader preferences written for pack "
+                                 f"{prefs.pack!r}, running {self.pack.name!r}")
+            return
+        if prefs.profile and prefs.profile != self.profile_name:
+            self.options.apply_profile(prefs.profile, self.props)
+            self.profile_name = prefs.profile
+        self.options.loads(prefs.text)
+        self.prefs_status = f"loaded shader preferences from {name}" + (
+            f" (profile {prefs.profile})" if prefs.profile else "")
+
+    def save_prefs(self, path: Any = None, *, title: str = "mcshader preferences") -> Any:
+        """Write the current option values to a prefs file (default: the
+        ``prefs`` this renderer was made with). Returns the path."""
+        path = path if path is not None else self.prefs_path
+        if path is None:
+            raise ValueError("no prefs path: pass one, or construct with prefs=")
+        text = format_prefs(self.options.dumps(), pack=self.pack.name,
+                            profile=self.profile_name, title=title)
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(text)
+        return path
 
     def swap_pack(self, pack_path: str) -> None:
         """Re-shade the whole scene with a different pack, keeping tags and
@@ -540,8 +623,31 @@ class PipelineRenderer:
         self._sky_np = sky
         return sky
 
+    # -- progress ---------------------------------------------------------
+    def _report(self, stage: str, message: str, *, program: str | None = None,
+                ok: bool = True, cached: bool = False) -> None:
+        if self.progress is None:
+            return
+        try:
+            self.progress(BuildProgress(
+                stage, message, min(self._progress_done, self._progress_total),
+                self._progress_total, program, ok, self._builds, cached))
+        except Exception as exc:  # a broken loading screen must not break the build
+            print(f"[mcshader] progress callback failed: {exc!r}")
+
     # -- build / teardown -----------------------------------------------
-    def _build(self) -> None:
+    def _build(self, *, counted: bool = False) -> None:
+        if not counted:  # load_pack already counted its own build
+            self._builds += 1
+        # One step per program `_compile` will translate, plus one per view's
+        # render targets.
+        values = self.options.values()
+        self._progress_done = 0
+        self._progress_total = (
+            len(self._geometry_program_names()) + 1  # + shadow
+            + sum(1 for p in self.graph.fullscreen_passes()
+                  if p.kind != "shadowcomp" and p.enabled(values))
+            + len(self.views))
         self._uniform_types: dict[str, str] = {}   # non-sampler uniforms -> glsl type
         #: Last value pushed for each of the above, so `_update` can skip the ones
         #: that did not move. Dropped whenever the pipeline is torn down, because
@@ -557,16 +663,20 @@ class PipelineRenderer:
         self._build_shadow_pass()
         self._fullscreen = self._compile_fullscreen_passes()
         for view in self.views:
+            self._report("targets", f"Allocating render targets ({view.name})")
             view._reset()
             self._alloc_buffers(view)
             self._build_scene_target(view)
             self._build_fullscreen_chain(view)
             self._bind_view_samplers(view)
+            self._progress_done += 1
         # Shared samplers go on render so all tagged geometry inherits them;
         # per-view ones ride on each view camera (`_bind_view_samplers`).
         # Per-frame scalar/matrix uniforms are pushed by the update task.
         self._bind_inputs(self.base.render, scope="shared")
         self._ensure_task()
+        self._progress_done = self._progress_total
+        self._report("done", "Shaderpack ready")
 
     def _max_color_attachments(self) -> int:
         """Usable simultaneous render targets (Panda binds 1 color + 4 aux)."""
@@ -629,16 +739,16 @@ class PipelineRenderer:
                 pass
         self._geometry.clear()
 
+    def _geometry_program_names(self) -> list[str]:
+        """The gbuffers programs the pack's render types resolve to."""
+        return sorted({self.resolver.program(rt) for rt in self.resolver.types()} - {None})
+
     def _compile_geometry_programs(self) -> dict[str, Any]:
         """Compile every gbuffers program this pack ships, keyed by name."""
         from panda3d.core import Shader
 
         compiled: dict[str, Any] = {}
-        wanted = {
-            self.resolver.program(rt)
-            for rt in self.resolver.types()
-        } - {None}
-        for program in wanted:
+        for program in self._geometry_program_names():
             shader = self._compile(program, mode="gbuffer", camera_macros=True)
             if shader is not None:
                 compiled[program] = shader
@@ -654,30 +764,59 @@ class PipelineRenderer:
         lets a fullscreen pass with no vertex stage borrow the canonical quad vertex.
         ``return_info`` additionally returns the :class:`TranslatedPass` (needed
         to detect a pass that reads the same ``colortex`` it writes).
+
+        Results are cached by everything the translation reads, so a rebuild
+        that changes only the views (`set_views`, e.g. a headset connecting)
+        or returns to earlier option values translates nothing.
         """
+        key = (name, mode, allow_fallback_vertex, camera_macros, self.world, self.target,
+               tuple(sorted(self._gbuffer_map.items())),
+               tuple(sorted((k, str(v)) for k, v in self.options.values().items())))
+        cached = self._shader_cache.get(key)
+        hit = cached is not None
+        if not hit:
+            self._report("program", f"Translating {name}", program=name)
+            cached = self._translate(name, mode=mode, camera_macros=camera_macros,
+                                     allow_fallback_vertex=allow_fallback_vertex)
+            self._shader_cache[key] = cached
+            while len(self._shader_cache) > self._SHADER_CACHE_SIZE:
+                self._shader_cache.popitem(last=False)
+        else:
+            self._shader_cache.move_to_end(key)
+        shader, tp, vertex = cached
+        ok = shader is not None
+        self._progress_done += 1
+        self._report("program", f"Translated {name}" if ok else f"Skipped {name}",
+                     program=name, ok=ok, cached=hit)
+        if not ok:
+            return (None, None) if return_info else None
+        self._record_uniforms(vertex)
+        self._record_uniforms(tp.fragment)
+        return (shader, tp) if return_info else shader
+
+    def _translate(self, name: str, *, mode: str, camera_macros: bool,
+                   allow_fallback_vertex: bool) -> tuple[Any, Any, str | None]:
+        """(shader, TranslatedPass, vertex source), or Nones if it won't compile."""
         from panda3d.core import Shader
         from ..glsl.fullscreen import FULLSCREEN_VERTEX
 
-        fail = (None, None) if return_info else None
         try:
             tp = translate_pass(
                 self.pack, self.options, name, world=self.world, target=self.target,
                 mode=mode, gbuffer_map=self._gbuffer_map, max_location=8,
                 camera_macros=camera_macros)
             if not tp.fragment:
-                return fail
+                return None, None, None
             vertex = tp.vertex
             if vertex is None and allow_fallback_vertex:
                 vertex = FULLSCREEN_VERTEX
             if vertex is None:
-                return fail
-            self._record_uniforms(vertex)
-            self._record_uniforms(tp.fragment)
+                return None, None, None
             shader = Shader.make(Shader.SL_GLSL, vertex=vertex, fragment=tp.fragment)
-            return (shader, tp) if return_info else shader
+            return shader, tp, vertex
         except Exception as exc:  # a pass that won't compile degrades to skip
             print(f"[mcshader] program {name!r} skipped: {str(exc)[:200]}")
-            return fail
+            return None, None, None
 
     # -- buffers ---------------------------------------------------------
     def _tex_format(self, mc_format: str):

@@ -22,7 +22,7 @@ from __future__ import annotations
 from contextlib import contextmanager
 from typing import Any
 
-__all__ = ["VRBridge", "VR_OPTION_OVERRIDES"]
+__all__ = ["VRBridge", "VR_OPTION_OVERRIDES", "override_options"]
 
 #: Pack options switched off while rendering to a headset. They simulate a
 #: *camera* looking at a flat screen -- a focus point at the screen centre,
@@ -46,6 +46,21 @@ def _same(a: Any, b: Any) -> bool:
     return str(a).lower() == str(b).lower()
 
 
+def override_options(options: Any, overrides: dict) -> dict[str, Any]:
+    """Set ``overrides`` on a ``ShaderOptions`` (names the pack lacks are
+    skipped); returns the values they replaced, to put back later."""
+    replaced = {}
+    for name, value in overrides.items():
+        if name not in options.options:
+            continue
+        current = options.get(name)
+        if _same(current, value):
+            continue
+        replaced[name] = current
+        options.set(name, value)
+    return replaced
+
+
 class VRBridge:
     def __init__(self, pipe: Any, vr: Any, *, hidden_area: bool = False,
                  option_overrides: dict | None = None):
@@ -64,7 +79,9 @@ class VRBridge:
         self.hidden_area = hidden_area
         self.option_overrides = dict(VR_OPTION_OVERRIDES if option_overrides is None
                                      else option_overrides)
-        self._saved_options: dict[str, Any] = {}
+        # Values the pipeline already overrode before its first build (see
+        # `PipelineRenderer(option_overrides=)`), so they are not compiled twice.
+        self._saved_options: dict[str, Any] = dict(getattr(pipe, "overridden_options", {}))
         self.active = False
         self.textures: list[Any] = []
         self._events = DirectObject()
@@ -108,19 +125,11 @@ class VRBridge:
         self.pipe.set_views([PipelineView("window", self.pipe.base.cam)], reparse=changed)
 
     def _apply_overrides(self) -> bool:
-        options = self.pipe.options
-        changed = False
-        for name, value in self.option_overrides.items():
-            if name not in options.options:
-                continue
-            current = options.get(name)
-            if _same(current, value):
-                continue
-            # Anything else is the user's own choice (first time, or changed in a
-            # settings panel since): remember it, then override it again.
-            self._saved_options[name] = current
-            options.set(name, value)
-            changed = True
+        # Anything not already overridden is the user's own choice (first time,
+        # or changed in a settings panel since): remember it, then override it.
+        replaced = override_options(self.pipe.options, self.option_overrides)
+        self._saved_options.update(replaced)
+        changed = bool(replaced)
         if changed:
             print("[mcshader] VR: switched off screen-only effects: "
                   + ", ".join(sorted(self._saved_options)))
