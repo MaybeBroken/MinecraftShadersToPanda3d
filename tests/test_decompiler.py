@@ -6,9 +6,9 @@ import pytest
 
 from mcshader import load_pack, decompile_program
 
-PACK_DIR = os.path.join(os.path.dirname(__file__), "..", "Shaders")
+PACK_DIR = os.path.join(os.path.dirname(__file__), "..", "Shaders", "BSL_v10.0.zip")
 pytestmark = pytest.mark.skipif(
-    not os.path.isdir(PACK_DIR), reason="Shaders/ pack not present"
+    not os.path.isfile(PACK_DIR), reason="Shaders/BSL_v10.0.zip not present"
 )
 
 LEGACY = {

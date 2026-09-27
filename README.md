@@ -63,6 +63,40 @@ app.attach(crystal, type="glowing", block="minecraft:sea_lantern")
 `app.pipe` is the full pipeline renderer and `app.base` your `ShowBase`, so
 nothing is a dead end.
 
+## VR
+
+With [Panda3d-VR](https://github.com/MaybeBroken/Panda3d-VR) installed (`pip install -e path/to/Panda3d-VR`), pass its `VRManager` and the pack renders in the headset:
+
+```python
+from panda3d_vr import BaseVrApp
+import mcshader
+
+class Game(BaseVrApp):
+    def __init__(self):
+        super().__init__(msaa=0)            # the pack does its own anti-aliasing
+        self.shaders = mcshader.init(self, pack="BSL_v10.0.zip", profile="MEDIUM", vr=self.vr)
+```
+
+How it works:
+
+- **Headset connected.** Each eye runs the pack's whole pipeline from its own camera: gbuffers, deferred lighting, composites and TAA history. The compiled programs, the shadow map and the sky are shared between the eyes.
+- **Handover to the headset.** Each eye's final image, plus its float depth for the compositor's reprojection, is handed to the headset on the GPU.
+- **No headset.** The window keeps rendering through Panda3d-VR's desktop simulator. Connecting a headset later switches over automatically.
+- **Camera.** `app.camera(near=..., far=...)` sets the headset's clip planes. The FOV and camera pose come from the headset.
+
+`examples/vr_demo.py` is a runnable version.
+
+Underneath is `PipelineView`, which works with any number of cameras (not just VR):
+
+```python
+from mcshader.engine.panda3d_pipeline import PipelineView
+
+tex = Texture()
+app.pipe.set_views([PipelineView("mirror", mirror_cam, size=(1024, 1024), output=tex)])
+```
+
+Geometry programs read the camera from Panda's per-camera built-ins (`p3d_ViewMatrix`...), rewritten at translation time (`mcshader.glsl.views`). Per-view images are bound on each view's camera. As a result, extra views cost nothing per frame beyond their own rendering.
+
 ## Notes
 
 Validated against BSL v10 on Apple M1 / Mesa, OpenGL 4.6 core. BSL is the only shaderpack confirmed to work, more will be fixed and implemented later

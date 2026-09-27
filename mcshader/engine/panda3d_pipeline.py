@@ -35,7 +35,24 @@ from ..pipeline.graph import PipelineGraph, build_graph
 from ..pipeline.rendertypes import RenderTypeResolver
 from ..pipeline.translate import translate_pass
 
-__all__ = ["PipelineRenderer"]
+__all__ = ["PipelineRenderer", "PipelineView"]
+
+#: Uniforms that describe the camera a frame is rendered from. Fullscreen
+#: passes are per view, so each view's quads get its own values; geometry
+#: programs derive them from Panda's per-camera built-ins instead (see
+#: `mcshader.glsl.views`), and ``render`` only carries the reference view's
+#: copy for the shadow program.
+_VIEW_UNIFORMS = frozenset({
+    "gbufferModelView", "gbufferModelViewInverse", "gbufferPreviousModelView",
+    "gbufferProjection", "gbufferProjectionInverse", "gbufferPreviousProjection",
+    "cameraPosition", "previousCameraPosition",
+    "sunPosition", "moonPosition", "shadowLightPosition", "upPosition",
+    "shadowModelView", "shadowModelViewInverse",
+    "viewWidth", "viewHeight", "aspectRatio", "near", "far",
+})
+
+#: Samplers holding one view's own images; bound per camera, never on render.
+_VIEW_SAMPLER_RE = re.compile(r"^(colortex\d+|depthtex[012]|gcolor|gdepth|gnormal|composite|gaux[1-4])$")
 
 # Minecraft internal format name -> Panda3D Texture format enum name.
 _MC_FORMATS = {
@@ -45,6 +62,61 @@ _MC_FORMATS = {
     "RGBA32F": "F_rgba32", "RGB32F": "F_rgb32", "R32F": "F_r32",
     "R11F_G11F_B10F": "F_r11_g11_b10", "RGB10_A2": "F_rgb10_a2",
 }
+
+
+class PipelineView:
+    """One camera the pipeline renders through.
+
+    The default view is the window: ``base.cam`` rendered into the gbuffer and
+    the pack's final pass drawn on ``render2d``. Offscreen views (a VR
+    headset's eyes, a render-to-texture camera) instead get the final pass
+    written into ``output``, a Texture of ``size``. Every view has its own
+    gbuffer, depth, composite chain and TAA history; the compiled programs,
+    shadow map and sky are shared. All views must be the same size.
+
+    ``float_depth`` makes the scene depth (``depth_tex``) 32-bit float.
+
+    ``underlays`` are cameras whose display regions are drawn into this
+    view's gbuffer before the scene (e.g. a VR hidden-area mesh, which then
+    saves the whole pipeline's work on pixels the lenses can't show).
+    """
+
+    def __init__(self, name: str, camera: Any, *, size: tuple[int, int] | None = None,
+                 output: Any = None, underlays: tuple = (), float_depth: bool = False):
+        self.name = name
+        #: 32-bit float scene depth instead of 24-bit (what VR compositors
+        #: accept for reprojection; the pack samples it the same way).
+        self.float_depth = float_depth
+        self.camera = camera
+        self.size = size
+        self.output = output
+        self.underlays = list(underlays)
+        self._reset()
+
+    @property
+    def lens(self) -> Any:
+        return self.camera.node().get_lens()
+
+    @property
+    def is_window(self) -> bool:
+        return self.output is None
+
+    def _reset(self) -> None:
+        self.colortex: dict[int, Any] = {}
+        self.colortex_back: dict[int, Any] = {}
+        self.quads: list[Any] = []
+        self.final_quads: list[Any] = []
+        self.buffers: list[Any] = []
+        self.swaps: dict[int, int] = {}
+        self.scene_buf = None
+        self.depth_tex = None
+        self.opaque_depth_tex = None
+        self.opaque_depth_cam = None
+        self.uniform_cache: dict[str, Any] = {}
+        self.saved_initial_state = None
+
+    def __repr__(self) -> str:
+        return f"<PipelineView {self.name} {'window' if self.is_window else self.size}>"
 
 
 class PipelineRenderer:
@@ -126,13 +198,11 @@ class PipelineRenderer:
         self.base = base
         self.world = world
         self.target = target
+        #: Cameras the pack renders through; see `set_views`.
+        self.views: list[PipelineView] = [PipelineView("window", base.cam)]
         self._geometry: list[tuple[Any, str]] = []  # (nodepath, render_type)
         #: 0 in air, 1 under water, 2 in lava; see `set_eye_in_water`.
         self.eye_in_water = 0
-        self._quads: list[Any] = []
-        self._final_quads: list[Any] = []  # subset of _quads that cover the window
-        self._colortex: dict[int, Any] = {}
-        self._colortex_back: dict[int, Any] = {}
         self._task_started = False
         self._enabled = True  # see set_enabled() -- pack-shaded vs. plain rendering
         self.profile_name: str | None = None
@@ -181,6 +251,37 @@ class PipelineRenderer:
         self.load_pack(pack_path, profile=profile)
         for nodepath, render_type in tags:
             self.set_render_type(nodepath, render_type)
+
+    def set_views(self, views: list[PipelineView], *, reparse: bool = False) -> None:
+        """Render through these views instead (rebuilds, keeping tags).
+
+        ``reparse`` re-reads the pack's properties and pass graph against the
+        current option values first -- needed when options were changed at
+        the same time, since an option can switch whole passes on or off.
+        """
+        sizes = {v.size for v in views if not v.is_window}
+        if len(sizes) > 1 or (sizes and any(v.is_window for v in views)):
+            raise ValueError("all pipeline views must share one size")
+        tags = list(self._geometry)
+        self._teardown()
+        self.views = list(views)
+        if reparse:
+            self.props = self.pack.properties(self.options.values())
+            self.graph = build_graph(self.pack, self.world, self.options.values())
+        self._build()
+        for nodepath, render_type in tags:
+            self.set_render_type(nodepath, render_type)
+
+    @property
+    def reference_view(self) -> PipelineView:
+        """The view the shadow map and sky are centred on."""
+        return self.views[0]
+
+    def _view_size(self, view: PipelineView) -> tuple[int, int]:
+        if view.size is not None:
+            return view.size
+        win = self.base.win
+        return (win.get_x_size(), win.get_y_size()) if win else (1280, 720)
 
     def apply_profile(self, name: str) -> None:
         self.options.apply_profile(name, self.props)
@@ -269,8 +370,9 @@ class PipelineRenderer:
         its look there.
         """
         self._enabled = enabled
-        for quad in self._final_quads:
-            (quad.show if enabled else quad.hide)()
+        for view in self.views:
+            for quad in view.final_quads:
+                (quad.show if enabled else quad.hide)()
         for nodepath, render_type in self._geometry:
             if enabled:
                 program = self.resolver.program(render_type)
@@ -406,7 +508,8 @@ class PipelineRenderer:
         works without the caller having to coordinate lens settings; pass a
         smaller ``radius`` if you want the horizon closer.
         """
-        far = self.base.camLens.get_far() if self.base.camLens else radius
+        lens = self.reference_view.lens if self.reference_view.camera else None
+        far = lens.get_far() if lens else radius
         radius = min(radius, far * 0.9)
 
         sky = self.base.loader.load_model("models/misc/sphere")
@@ -449,14 +552,20 @@ class PipelineRenderer:
         self._fallback_normal = None
         self._maxattach = self._max_color_attachments()
         self._gbuffer_map = self._compute_gbuffer_map()
-        self._alloc_buffers()
+        self._buffers = []
         self._compiled_geometry = self._compile_geometry_programs()
         self._build_shadow_pass()
-        self._build_scene_target()
-        self._build_fullscreen_chain()
-        # Bind samplers on render so all tagged geometry inherits them; per-frame
-        # scalar/matrix uniforms are pushed by the update task.
-        self._bind_inputs(self.base.render)
+        self._fullscreen = self._compile_fullscreen_passes()
+        for view in self.views:
+            view._reset()
+            self._alloc_buffers(view)
+            self._build_scene_target(view)
+            self._build_fullscreen_chain(view)
+            self._bind_view_samplers(view)
+        # Shared samplers go on render so all tagged geometry inherits them;
+        # per-view ones ride on each view camera (`_bind_view_samplers`).
+        # Per-frame scalar/matrix uniforms are pushed by the update task.
+        self._bind_inputs(self.base.render, scope="shared")
         self._ensure_task()
 
     def _max_color_attachments(self) -> int:
@@ -478,11 +587,17 @@ class PipelineRenderer:
     def _teardown(self) -> None:
         from panda3d.core import GraphicsOutput  # noqa: F401
 
-        for quad in self._quads:
-            try:
-                quad.remove_node()
-            except Exception:
-                pass
+        for view in self.views:
+            for quad in view.quads:
+                try:
+                    quad.remove_node()
+                except Exception:
+                    pass
+            if view.opaque_depth_cam is not None:
+                view.opaque_depth_cam.remove_node()
+            if view.saved_initial_state is not None and view.camera is not None:
+                view.camera.node().set_initial_state(view.saved_initial_state)
+            view._reset()
         for buf in getattr(self, "_buffers", []):
             try:
                 self.base.graphicsEngine.remove_window(buf)
@@ -502,15 +617,10 @@ class PipelineRenderer:
             except Exception:
                 pass
             self._shadow_cam = None
-        self._quads.clear()
-        self._final_quads.clear()
         # These uniforms were pushed to nodes that no longer exist, so nothing
         # may be skipped on the grounds that it was already set.
         self._uniform_cache.clear()
-        self._colortex.clear()
-        self._colortex_back.clear()
         self._buffers = []
-        self._depth_tex = None
         for nodepath, _ in self._geometry:
             try:
                 nodepath.clear_shader()
@@ -529,13 +639,14 @@ class PipelineRenderer:
             for rt in self.resolver.types()
         } - {None}
         for program in wanted:
-            shader = self._compile(program, mode="gbuffer")
+            shader = self._compile(program, mode="gbuffer", camera_macros=True)
             if shader is not None:
                 compiled[program] = shader
         return compiled
 
     def _compile(self, name: str, *, mode: str = "compact",
-                 allow_fallback_vertex: bool = False, return_info: bool = False) -> Any:
+                 allow_fallback_vertex: bool = False, return_info: bool = False,
+                 camera_macros: bool = False) -> Any:
         """Translate + make a Panda3D shader for a program (None on failure).
 
         ``mode`` picks the fragment-output routing ("gbuffer" for the shared
@@ -551,7 +662,8 @@ class PipelineRenderer:
         try:
             tp = translate_pass(
                 self.pack, self.options, name, world=self.world, target=self.target,
-                mode=mode, gbuffer_map=self._gbuffer_map, max_location=8)
+                mode=mode, gbuffer_map=self._gbuffer_map, max_location=8,
+                camera_macros=camera_macros)
             if not tp.fragment:
                 return fail
             vertex = tp.vertex
@@ -573,12 +685,11 @@ class PipelineRenderer:
 
         return getattr(Texture, _MC_FORMATS.get(mc_format, "F_rgba16"))
 
-    def _alloc_colortex(self, index: int, mc_format: str) -> Any:
+    def _alloc_colortex(self, index: int, mc_format: str, view: PipelineView) -> Any:
         from panda3d.core import Texture
 
-        w = self.base.win.get_x_size() if self.base.win else 1280
-        h = self.base.win.get_y_size() if self.base.win else 720
-        tex = Texture(f"colortex{index}")
+        w, h = self._view_size(view)
+        tex = Texture(f"colortex{index}-{view.name}")
         tex.setup_2d_texture(w, h, Texture.T_float, self._tex_format(mc_format))
         # Zero the texture's backing store ONCE, at creation, before any pass
         # can read it. Per-frame clearing is a separate decision made in
@@ -603,15 +714,14 @@ class PipelineRenderer:
         tex.set_magfilter(Texture.FT_linear)
         return tex
 
-    def _alloc_buffers(self) -> None:
-        self._buffers = []
+    def _alloc_buffers(self, view: PipelineView) -> None:
         for index, fmt in self.graph.buffers.formats.items():
-            self._colortex[index] = self._alloc_colortex(index, fmt)
+            view.colortex[index] = self._alloc_colortex(index, fmt, view)
             # Ping-pong twin for composite read-after-write.
-            self._colortex_back[index] = self._alloc_colortex(index, fmt)
+            view.colortex_back[index] = self._alloc_colortex(index, fmt, view)
 
     def _make_buffer(self, name: str, colortex_indices: list[int | None], want_depth: bool,
-                     sort: int = -10) -> Any:
+                     sort: int = -10, view: PipelineView | None = None) -> Any:
         """Create an offscreen MRT buffer with one attachment per entry of
         ``colortex_indices`` (primary color, then aux 0..3) — ``None`` for a
         slot with no meaningful colortex (cleared normally, nothing else
@@ -640,12 +750,14 @@ class PipelineRenderer:
         # buffer never allocated — that produced a total white-screen
         # failure, not a partial one, which is exactly what surfaced this.
         fb.set_aux_hrgba(max(0, n_color - 1))
+        view = view or self.reference_view
         if want_depth:
-            fb.set_depth_bits(24)
+            fb.set_depth_bits(32 if view.float_depth else 24)
+            fb.set_float_depth(view.float_depth)
         win = self.base.win
         buf = self.base.graphicsEngine.make_output(
-            win.get_pipe(), name, sort, fb, WindowProperties.size(
-                win.get_x_size(), win.get_y_size()),
+            win.get_pipe(), f"{name}-{view.name}", sort, fb,
+            WindowProperties.size(*self._view_size(view)),
             GraphicsPipe.BF_refuse_window, win.get_gsg(), win)
         # Every attachment (primary + aux) starts as driver-allocated VRAM,
         # not zeroed — unlike the fixed-point 8-bit format this used to
@@ -684,9 +796,10 @@ class PipelineRenderer:
             if should_clear:
                 buf.set_clear_value(plane, (0, 0, 0, 0))
         self._buffers.append(buf)
+        view.buffers.append(buf)
         return buf
 
-    def _bind_scene_attachments(self, buf: Any) -> None:
+    def _bind_scene_attachments(self, buf: Any, view: PipelineView) -> None:
         """Bind each packed gbuffer colortex to its attachment slot."""
         from panda3d.core import GraphicsOutput
 
@@ -694,20 +807,20 @@ class PipelineRenderer:
             getattr(GraphicsOutput, f"RTP_aux_hrgba_{i}") for i in range(4)
         ]
         for colortex, slot in sorted(self._gbuffer_map.items(), key=lambda kv: kv[1]):
-            if slot < len(slots) and colortex in self._colortex:
+            if slot < len(slots) and colortex in view.colortex:
                 buf.add_render_texture(
-                    self._colortex[colortex], GraphicsOutput.RTM_bind_or_copy, slots[slot])
+                    view.colortex[colortex], GraphicsOutput.RTM_bind_or_copy, slots[slot])
 
-    def _build_scene_target(self) -> None:
-        """Point the main camera at the gbuffer MRT instead of the window."""
+    def _build_scene_target(self, view: PipelineView) -> None:
+        """Point the view's camera at the gbuffer MRT instead of the window."""
         slot_of = {slot: colortex for colortex, slot in self._gbuffer_map.items()}
         n_targets = max(1, len(self._gbuffer_map))
         gbuffer_indices = [slot_of.get(i) for i in range(n_targets)]
         # Render the gbuffer before every composite pass.
-        self._scene_buf = self._make_buffer(
-            "mcshader-gbuffer", gbuffer_indices, want_depth=True, sort=-100)
-        self._scene_buf.set_clear_color((0, 0, 0, 1))
-        self._bind_scene_attachments(self._scene_buf)
+        scene_buf = view.scene_buf = self._make_buffer(
+            "mcshader-gbuffer", gbuffer_indices, want_depth=True, sort=-100, view=view)
+        scene_buf.set_clear_color((0, 0, 0, 1))
+        self._bind_scene_attachments(scene_buf, view)
         # The gbuffer pass's real depth buffer, as a texture — this is what
         # every pack means by `depthtex0/1/2`. It was never attached before
         # (the FBO had depth *bits*, but nothing to sample them through), and
@@ -734,12 +847,16 @@ class PipelineRenderer:
         # there along every silhouette — exactly where AO and SSR sample most.
         depth.set_minfilter(Texture.FT_nearest)
         depth.set_magfilter(Texture.FT_nearest)
-        self._scene_buf.add_render_texture(
+        scene_buf.add_render_texture(
             depth, GraphicsOutput.RTM_bind_or_copy, GraphicsOutput.RTP_depth)
-        self._depth_tex = depth
-        dr = self._scene_buf.make_display_region()
-        dr.set_camera(self.base.cam)
-        self._build_opaque_depth_target()
+        view.depth_tex = depth
+        for i, underlay in enumerate(view.underlays):
+            pre = scene_buf.make_display_region()
+            pre.set_sort(-10 + i)
+            pre.set_camera(underlay)
+        dr = scene_buf.make_display_region()
+        dr.set_camera(view.camera)
+        self._build_opaque_depth_target(view)
 
     @staticmethod
     def _opaque_depth_bit() -> Any:
@@ -748,7 +865,7 @@ class PipelineRenderer:
 
         return BitMask32.bit(5)
 
-    def _build_opaque_depth_target(self) -> None:
+    def _build_opaque_depth_target(self, view: PipelineView) -> None:
         """A second depth buffer with the translucent geometry left out.
 
         Minecraft gives a pack three depth textures that differ by what is *missing*
@@ -775,19 +892,17 @@ class PipelineRenderer:
         from panda3d.core import (Camera, FrameBufferProperties, GraphicsOutput,
                                   GraphicsPipe, Texture, WindowProperties)
 
-        self._opaque_depth_tex = None
-        self._opaque_depth_cam = None
         if not ({"depthtex1", "depthtex2"} & self._sampler_names):
             return
         win = self.base.win
-        if win is None or self.base.cam is None:
+        if win is None or view.camera is None:
             return
 
-        size = (win.get_x_size(), win.get_y_size())
+        size = self._view_size(view)
         fb = FrameBufferProperties()
         fb.set_depth_bits(24)
         buf = self.base.graphicsEngine.make_output(
-            win.get_pipe(), "mcshader-opaque-depth", -150, fb,
+            win.get_pipe(), f"mcshader-opaque-depth-{view.name}", -150, fb,
             WindowProperties.size(*size), GraphicsPipe.BF_refuse_window,
             win.get_gsg(), win)
         if buf is None:
@@ -800,16 +915,16 @@ class PipelineRenderer:
         buf.add_render_texture(tex, GraphicsOutput.RTM_bind_or_copy,
                                GraphicsOutput.RTP_depth)
         self._buffers.append(buf)
-        self._opaque_depth_buf = buf
-        self._opaque_depth_tex = tex
+        view.buffers.append(buf)
+        view.opaque_depth_tex = tex
 
-        cam = Camera("mcshader-opaque-depth-cam", self.base.cam.node().get_lens())
+        cam = Camera("mcshader-opaque-depth-cam", view.lens)
         cam.set_camera_mask(self._opaque_depth_bit())
-        self._opaque_depth_cam = self.base.cam.attach_new_node(cam)
+        view.opaque_depth_cam = view.camera.attach_new_node(cam)
         sky_np = getattr(self, "_sky_np", None)
         if sky_np is not None:
             sky_np.hide(self._opaque_depth_bit())
-        buf.make_display_region().set_camera(self._opaque_depth_cam)
+        buf.make_display_region().set_camera(view.opaque_depth_cam)
 
     def _sun_direction(self, time_angle: float = 0.25) -> Any:
         """Direction from the scene toward the sun, at a given ``timeAngle``
@@ -1063,8 +1178,8 @@ class PipelineRenderer:
         # even further relative to the (still misplaced) visible scene. See
         # the matching per-frame update in `_dynamic_uniforms`.
         from panda3d.core import LPoint3
-        center = (self.base.cam.get_pos(self.base.render) if self.base.cam
-                  else LPoint3(0, 0, 0))
+        ref_cam = self.reference_view.camera
+        center = ref_cam.get_pos(self.base.render) if ref_cam else LPoint3(0, 0, 0)
         # _sun_direction() is in Minecraft's Y-up convention (see its
         # docstring); this engine's actual scene-graph node needs it back in
         # native Z-up to be positioned correctly — see `_cs_conversion`.
@@ -1178,46 +1293,57 @@ class PipelineRenderer:
         referenced = {int(m) for m in self._COLORTEX_REF_RE.findall(tp.fragment)}
         return referenced & set(tp.outputs)
 
-    def _build_fullscreen_chain(self) -> None:
-        from panda3d.core import CardMaker, NodePath, Camera, OrthographicLens
-
-        self._swaps: dict[int, int] = {}
+    def _compile_fullscreen_passes(self) -> list[tuple[Any, Any, Any, int]]:
+        """Compile every enabled fullscreen pass once: (pass, shader, info, order)."""
         values = self.options.values()
         passes = [p for p in self.graph.fullscreen_passes()
                   if p.kind != "shadowcomp" and p.enabled(values)]
+        compiled = []
         for i, p in enumerate(passes):
             shader, tp = self._compile(p.name, mode="compact", allow_fallback_vertex=True,
                                        return_info=True)
-            if shader is None:
-                continue
+            if shader is not None:
+                compiled.append((p, shader, tp, i))
+        self._fullscreen_count = len(passes)
+        return compiled
+
+    def _build_fullscreen_chain(self, view: PipelineView) -> None:
+        from panda3d.core import CardMaker, NodePath
+
+        for p, shader, tp, i in self._fullscreen:
             cm = CardMaker(f"mcshader-{p.name}")
             cm.set_frame_fullscreen_quad()
             quad = NodePath(cm.generate())
             quad.set_shader(shader)
-            self._bind_inputs(quad, is_quad=True)
+            self._bind_inputs(quad, is_quad=True, view=view)
             is_final = (p.kind == "final")
             hazards = self._self_read_outputs(tp)
-            self._render_quad(quad, p, is_final=is_final, order=i, hazards=hazards)
-            self._quads.append(quad)
+            self._render_quad(quad, p, is_final=is_final, order=i, hazards=hazards, view=view)
+            view.quads.append(quad)
             if is_final:
-                self._final_quads.append(quad)
+                view.final_quads.append(quad)
                 if not self._enabled:  # a rebuild while pack is toggled off
                     quad.hide()
-        self._build_history_resolves(len(passes))
+        self._build_history_resolves(self._fullscreen_count, view)
 
     def _render_quad(self, quad: Any, p: Any, *, is_final: bool, order: int,
-                     hazards: frozenset[int] | set[int] = frozenset()) -> None:
+                     hazards: frozenset[int] | set[int] = frozenset(),
+                     view: PipelineView | None = None) -> None:
         """Render one fullscreen pass into its target colortex (or the window)."""
         from panda3d.core import (Camera, OrthographicLens, NodePath, GraphicsOutput)
 
+        view = view or self.reference_view
         quad.set_depth_test(False)
         quad.set_depth_write(False)
 
-        if is_final:
+        if is_final and view.is_window:
             # set_frame_fullscreen_quad() cards are made for render2d, which
             # ShowBase already draws to the window — the reliable way to blit.
             quad.reparent_to(self.base.render2d)
             quad.set_bin("fixed", 100 + order)
+            return
+        if is_final:
+            self._render_final_to_texture(quad, p, order, view)
             return
 
         # Intermediate pass: render the quad into its target colortex via a small
@@ -1237,7 +1363,7 @@ class PipelineRenderer:
         targets = p.outputs or [0]
         n_color = max(1, min(len(targets), self._maxattach))
         buf = self._make_buffer(f"mcshader-{p.name}", targets[:n_color], want_depth=False,
-                                sort=-50 + order)
+                                sort=-50 + order, view=view)
         slots = [GraphicsOutput.RTP_color] + [
             getattr(GraphicsOutput, f"RTP_aux_hrgba_{i}") for i in range(4)
         ]
@@ -1247,16 +1373,42 @@ class PipelineRenderer:
             # the one it (and this quad's own shader input) is reading from —
             # sampling and rendering the same texture in one draw is a GL
             # feedback loop and was the source of the speckled-noise artifact.
-            dest = (self._colortex_back[colortex] if colortex in hazards
-                    else self._colortex[colortex])
+            dest = (view.colortex_back[colortex] if colortex in hazards
+                    else view.colortex[colortex])
             buf.add_render_texture(dest, GraphicsOutput.RTM_bind_or_copy, slots[slot])
         dr = buf.make_display_region()
         dr.set_camera(cam)
         for colortex in hazards:
             if colortex in targets[:n_color]:
-                self._colortex[colortex], self._colortex_back[colortex] = (
-                    self._colortex_back[colortex], self._colortex[colortex])
-                self._swaps[colortex] = self._swaps.get(colortex, 0) + 1
+                view.colortex[colortex], view.colortex_back[colortex] = (
+                    view.colortex_back[colortex], view.colortex[colortex])
+                view.swaps[colortex] = view.swaps.get(colortex, 0) + 1
+
+    def _render_final_to_texture(self, quad: Any, p: Any, order: int, view: PipelineView) -> None:
+        """The pack's final pass for an offscreen view: into ``view.output``
+        (8-bit, display-referred -- the same values the window would show)."""
+        from panda3d.core import (Camera, FrameBufferProperties, GraphicsOutput, GraphicsPipe,
+                                  NodePath, OrthographicLens, WindowProperties)
+
+        scene = NodePath(f"mcshader-scene-{p.name}-{view.name}")
+        quad.reparent_to(scene)
+        lens = OrthographicLens()
+        lens.set_film_size(2, 2)
+        lens.set_near_far(-1000, 1000)
+        cam = scene.attach_new_node(Camera(f"mcshader-cam-{p.name}", lens))
+        fb = FrameBufferProperties()
+        fb.set_rgba_bits(8, 8, 8, 8)
+        win = self.base.win
+        buf = self.base.graphicsEngine.make_output(
+            win.get_pipe(), f"mcshader-final-{view.name}", -50 + order + 20, fb,
+            WindowProperties.size(*self._view_size(view)), GraphicsPipe.BF_refuse_window,
+            win.get_gsg(), win)
+        buf.set_clear_color_active(True)
+        buf.set_clear_color((0, 0, 0, 1))
+        buf.add_render_texture(view.output, GraphicsOutput.RTM_bind_or_copy, GraphicsOutput.RTP_color)
+        buf.make_display_region().set_camera(cam)
+        self._buffers.append(buf)
+        view.buffers.append(buf)
 
     #: Trivial fullscreen copy, for `_build_history_resolves`.
     _RESOLVE_FRAGMENT = """\
@@ -1270,7 +1422,7 @@ void main() {
 }
 """
 
-    def _build_history_resolves(self, order: int) -> None:
+    def _build_history_resolves(self, order: int, view: PipelineView) -> None:
         """Close the ping-pong cycle for persistent buffers whose passes leave
         it open, so a cross-frame history buffer really carries a frame over.
 
@@ -1305,7 +1457,7 @@ void main() {
                                   Shader, GraphicsOutput)
         from ..glsl.fullscreen import FULLSCREEN_VERTEX
 
-        stranded = [idx for idx, n in sorted(self._swaps.items())
+        stranded = [idx for idx, n in sorted(view.swaps.items())
                     if n % 2 == 1 and not self.graph.buffers.clear.get(idx, True)]
         if not stranded:
             return
@@ -1318,7 +1470,7 @@ void main() {
             quad = NodePath(cm.generate())
             quad.reparent_to(scene)
             quad.set_shader(shader)
-            quad.set_shader_input("mcResolveSrc", self._colortex[idx])
+            quad.set_shader_input("mcResolveSrc", view.colortex[idx])
             quad.set_depth_test(False)
             quad.set_depth_write(False)
             lens = OrthographicLens()
@@ -1326,11 +1478,11 @@ void main() {
             lens.set_near_far(-1000, 1000)
             cam = scene.attach_new_node(Camera(f"mcshader-resolve-cam{idx}", lens))
             buf = self._make_buffer(f"mcshader-resolve{idx}", [idx], want_depth=False,
-                                    sort=-50 + order + i)
-            buf.add_render_texture(self._colortex_back[idx],
+                                    sort=-50 + order + i, view=view)
+            buf.add_render_texture(view.colortex_back[idx],
                                    GraphicsOutput.RTM_bind_or_copy, GraphicsOutput.RTP_color)
             buf.make_display_region().set_camera(cam)
-            self._quads.append(quad)
+            view.quads.append(quad)
 
     _UNIFORM_RE = None
 
@@ -1461,20 +1613,50 @@ void main() {
         tex.set_ram_image(bytes(rng.getrandbits(8) for _ in range(size * size * 4)))
         return tex
 
-    def _bind_inputs(self, node: Any, *, is_quad: bool = False) -> None:
-        """Bind every sampler the shaders declare (colortex/shadow/fallback)."""
+    def _bind_view_samplers(self, view: PipelineView) -> None:
+        """Per-view samplers (colortex/depthtex) for the *geometry* programs.
+
+        Geometry is one shared scene graph drawn by every view's camera, so a
+        per-view image cannot live on ``render``. It goes in the camera's
+        initial state instead: composed underneath render's own state, set
+        once per build, and never touched per frame.
+        """
+        from panda3d.core import NodePath, ShaderAttrib
+
+        if view.camera is None:
+            return
+        holder = NodePath("mcshader-view-inputs")
+        self._bind_inputs(holder, view=view, scope="view")
+        attrib = holder.get_attrib(ShaderAttrib)
+        cam = view.camera.node()
+        view.saved_initial_state = cam.get_initial_state()
+        if attrib is not None:
+            cam.set_initial_state(view.saved_initial_state.set_attrib(attrib))
+
+    def _bind_inputs(self, node: Any, *, is_quad: bool = False,
+                     view: PipelineView | None = None, scope: str = "all") -> None:
+        """Bind every sampler the shaders declare (colortex/shadow/fallback).
+
+        ``scope``: "all" (a fullscreen quad), "view" (only the per-view
+        images) or "shared" (everything *but* those -- for ``render``).
+        """
+        view = view or self.reference_view
         bound: set[str] = set()
+        want_view = scope in ("all", "view")
+        want_shared = scope in ("all", "shared")
 
         def bind(name: str, tex: Any) -> None:
-            node.set_shader_input(name, tex)
+            is_view = bool(_VIEW_SAMPLER_RE.match(name))
+            if (is_view and want_view) or (not is_view and want_shared):
+                node.set_shader_input(name, tex)
             bound.add(name)
 
-        for index, tex in self._colortex.items():
+        for index, tex in view.colortex.items():
             bind(f"colortex{index}", tex)
         aliases = {"gcolor": 0, "gdepth": 1, "gnormal": 2, "composite": 3,
                    "gaux1": 4, "gaux2": 5, "gaux3": 6, "gaux4": 7}
         for alias, idx in aliases.items():
-            bind(alias, self._colortex.get(idx, self._fallback_tex()))
+            bind(alias, view.colortex.get(idx, self._fallback_tex()))
         shadow_depth = getattr(self, "_shadow_tex", None) or self._fallback_tex()
         bind("shadowtex0", shadow_depth)
         # shadowtex1 is the opaque-only depth map, not a second name for the
@@ -1507,14 +1689,14 @@ void main() {
         # The fallback must be WHITE, not the black `_fallback_tex`: depth 0
         # is the near plane, i.e. "a surface pressed against the camera",
         # which reads as fully occluded everywhere.
-        depth_tex = getattr(self, "_depth_tex", None)
+        depth_tex = view.depth_tex
         if depth_tex is None:
             depth_tex = self._opaque_white_tex()
         bind("depthtex0", depth_tex)
         # depthtex1/2 exclude the translucents; see `_build_opaque_depth_target` for
         # what reads the difference and what goes wrong when there isn't one. They fall
         # back to depthtex0 only if that pass could not be built.
-        opaque_depth = getattr(self, "_opaque_depth_tex", None) or depth_tex
+        opaque_depth = view.opaque_depth_tex or depth_tex
         bind("depthtex1", opaque_depth)
         # depthtex2 additionally drops the held item, which this engine has no notion
         # of, so it is the same image.
@@ -1522,7 +1704,7 @@ void main() {
         bind("noisetex", self._pack_texture("noise"))
         # A fullscreen quad has no model texture; give its base sampler colortex0.
         if is_quad:
-            bind("p3d_Texture0", self._colortex.get(0, self._fallback_tex()))
+            node.set_shader_input("p3d_Texture0", view.colortex.get(0, self._fallback_tex()))
         # Anything else the shaders declared but we don't recognise -> fallback,
         # WITHOUT clobbering the real bindings above. A name containing
         # "normal" gets the flat-normal fallback (see _fallback_normal_tex);
@@ -1530,7 +1712,7 @@ void main() {
         for name in self._sampler_names:
             if name not in bound and name != "p3d_Texture0":
                 fallback = self._fallback_normal_tex() if "normal" in name.lower() else self._fallback_tex()
-                node.set_shader_input(name, fallback)
+                bind(name, fallback)
 
     # -- per-frame uniforms ---------------------------------------------
     #: Task sort for the per-frame uniform update. It has to be the *last* thing
@@ -1602,162 +1784,48 @@ void main() {
             "blindFactor": 0.0, "blindness": 0.0, "moonPhase": 0,
         }
 
-    def _dynamic_uniforms(self) -> dict[str, Any]:
-        """Compute the frame-varying uniform values we can derive from the scene."""
-        from panda3d.core import ClockObject, LMatrix4, LVecBase3
+    def _dynamic_uniforms(self) -> tuple[dict[str, Any], list[dict[str, Any]]]:
+        """Frame-varying uniform values: ``(shared, [one dict per view])``."""
+        from panda3d.core import ClockObject, LMatrix4
 
         clock = ClockObject.get_global_clock()
         t = clock.get_frame_time() % 3600.0
-        # base.cam (not base.camera, its parent — see _build_scene_target's
-        # dr.set_camera) is the node actually driving the render; base.camera
-        # sits at the origin by default and only base.cam moves when callers
-        # (rightly) pose the camera via base.cam.set_pos/look_at. Using the
-        # wrong one here meant gbufferModelView/cameraPosition/etc. stayed
-        # fixed at the origin no matter where the camera actually was.
-        render, cam_np, lens = self.base.render, self.base.cam, self.base.camLens
-        w = float(self.base.win.get_x_size()); h = float(self.base.win.get_y_size())
-        cam_pos = cam_np.get_pos(render)
+        render = self.base.render
         frame_count = int(clock.get_frame_count())
         day = self._day_cycle_uniforms(t, frame_count)
-
         cs_zup_to_yup, cs_yup_to_zup = self._cs_conversion()
-
-        # gbufferModelView/Inverse: OpenGL-standard view space (X-right,
-        # Y-up, Z-backward — the space every BSL shader's own math assumes
-        # its "view space" to be in) <-> Minecraft-Y-up world (relative to
-        # the PLAYER camera). This is a *three*-matrix rotation, not two:
-        # `cs_yup_to_zup` first relabels the OpenGL-view-space input back
-        # into Panda's native camera-local axes (X-right, Y-forward, Z-up —
-        # what Panda's own camera actually looks down), THEN `rot_player`
-        # carries it into native Panda world space, THEN `cs_zup_to_yup`
-        # relabels that into Minecraft's Y-up world. Dropping the first
-        # term (an earlier version of this code did) leaves the *shape* of
-        # gbufferModelView looking plausible — it's still a pure rotation,
-        # still self-cancels with its own inverse — but silently mismatches
-        # gbufferProjection, whose diagonal-shortcut consumers assume the
-        # standard convention (see the `proj` comment below): confirmed by
-        # reconstructing Panda's own CS_yup_right-lens projection matrix
-        # numerically as `cs_yup_to_zup * <Panda's native projection>` and
-        # checking it against Panda's own output with that coordinate
-        # system set — they match exactly.
-        #
-        # Built as a true inverse pair (gbuffer_mv is the *numeric* inverse
-        # of gbuffer_mv_inv) so every self-cancelling
-        # `gbufferModelView * gbufferModelViewInverse * ...` chain BSL's own
-        # vertex shaders use (see gbuffers_terrain.glsl) reduces to Panda's
-        # own real per-object transform, regardless of this matrix's
-        # semantics — real rendered geometry position is provably unaffected
-        # by this reconciliation, only the shaders' own world-space math is.
-        rot_player = self._rotation_only(cam_np.get_mat(render))  # player-view -> world
-        gbuffer_mv_inv = cs_yup_to_zup * rot_player * cs_zup_to_yup
-        gbuffer_mv = LMatrix4(gbuffer_mv_inv)
-        gbuffer_mv.invert_in_place()
-
-        # gbufferProjection must be in the *standard* OpenGL projection
-        # matrix convention, not Panda's native one. This isn't just about
-        # axis orientation for full `proj * modelview * v` chains (those
-        # would tolerate any consistent convention) — a lot of BSL's own
-        # code (`ToNDC`/`ToShadow`'s `projMAD`/`diagonal3` macros in
-        # spaceConversion.glsl, `GetLinearDepth` used throughout AO/light
-        # shafts/outline/bloom) reads specific *cells* of this matrix
-        # assuming the sparse layout of a standard symmetric-frustum
-        # projection (`m[0].x`/`m[1].y`/`m[2].zw`/`m[3]`). Panda's native
-        # `lens.get_projection_mat()` is mathematically a valid projection
-        # but puts those same terms in *different* cells (its camera-local
-        # convention is X-right/Y-forward/Z-up, not X-right/Y-up/
-        # Z-backward) — those shortcuts silently read zeros/garbage instead
-        # of the real depth/aspect terms. This was the root cause behind
-        # screen-space effects (AO, light shafts, SSR, bloom, DOF) and
-        # shadow-space reconstruction (`ToShadow`, see `shadowProjection`
-        # below) all being visibly broken despite the shadow map and gbuffer
-        # geometry themselves rendering correctly.
-        proj = cs_yup_to_zup * LMatrix4(lens.get_projection_mat())
-        proj_inv = LMatrix4(proj); proj_inv.invert_in_place()
-
-        camera_position_mc = cs_zup_to_yup.xform_point(cam_pos)
-
         sun_mc = self._sun_direction(day["timeAngle"])
-        sun_view = gbuffer_mv.xform_vec(sun_mc) * 100.0
-        up_view = gbuffer_mv.xform_vec(LVecBase3(0, 1, 0)) * 100.0
 
+        shadow = None
         shadow_cam_np = getattr(self, "_shadow_cam", None)
-        if shadow_cam_np is not None:
-            # Track the moving sun AND the player each frame, so the shadow
-            # map (and the shadowModelView/Projection derived from it below)
-            # stays centred on the camera — see the matching comment in
-            # `_build_shadow_pass` for why a fixed world-origin center is
-            # wrong. Re-centering every frame is what makes shadows follow
-            # the player around an arbitrarily large world instead of only
-            # ever looking right near (0,0,0).
+        ref_cam = self.reference_view.camera
+        if shadow_cam_np is not None and ref_cam is not None:
+            # Track the moving sun AND the viewer each frame, so the shadow map
+            # (and every shadow matrix derived from it) stays centred on the
+            # reference camera -- see `_build_shadow_pass` for why a fixed
+            # world-origin centre is wrong.
+            ref_pos = ref_cam.get_pos(render)
             dist = getattr(self, "_shadow_dist", 256.0)
             sun_panda = cs_yup_to_zup.xform_vec(sun_mc)
-            shadow_cam_np.set_pos(cam_pos + sun_panda * dist)
-            shadow_cam_np.look_at(cam_pos, self._safe_up(-sun_panda))
-
-            # Same standard-convention fix as `proj` above — confirmed the
-            # identical relabeling (`cs_yup_to_zup * <native>`) reproduces
-            # Panda's own CS_yup_right output for OrthographicLens too, not
-            # just PerspectiveLens. `ToShadow` (spaceConversion.glsl) uses
-            # the same `projMAD`/`diagonal3` cell-shortcut on
-            # shadowProjection that `ToNDC` uses on gbufferProjection — this
-            # was the actual cause of `GetShadow()` reading a garbage
-            # reference depth (see shadows.glsl), not a bias/acne issue as
-            # previously suspected.
+            shadow_cam_np.set_pos(ref_pos + sun_panda * dist)
+            shadow_cam_np.look_at(ref_pos, self._safe_up(-sun_panda))
+            # Same standard-convention relabeling as gbufferProjection below:
+            # `ToShadow` (spaceConversion.glsl) reads cells of this matrix.
             s_proj = cs_yup_to_zup * LMatrix4(shadow_cam_np.node().get_lens().get_projection_mat())
-            s_proj_inv = LMatrix4(s_proj); s_proj_inv.invert_in_place()
+            s_proj_inv = LMatrix4(s_proj)
+            s_proj_inv.invert_in_place()
+            rot_shadow = cs_yup_to_zup * self._rotation_only(shadow_cam_np.get_mat(render)) * cs_zup_to_yup
+            shadow_pos = shadow_cam_np.get_pos(render)
+            # World-anchored shadow view for the geometry programs' macros
+            # (`mcshader.glsl.views`): absolute Minecraft world -> shadow view.
+            world_inv = rot_shadow * LMatrix4.translate_mat(cs_zup_to_yup.xform_point(shadow_pos))
+            world = LMatrix4(world_inv)
+            world.invert_in_place()
+            shadow = (s_proj, s_proj_inv, rot_shadow, shadow_pos, world, world_inv)
 
-            # Same rotation-only reconciliation as gbufferModelView, but the
-            # shadow camera sits at a different real position than the
-            # player — `position`/`worldPos` in every BSL program (shadow
-            # pass included: see shadow.glsl's `worldPos = position.xyz +
-            # cameraPosition.xyz`) is always relative to the PLAYER's
-            # cameraPosition, so this also carries the
-            # (shadow-cam -> player-cam) offset, re-expressed in Minecraft's
-            # Y-up axes, as a translation. Still a true inverse pair with
-            # s_mv (numeric inverse below), so — exactly as with
-            # gbufferModelView — the real rendered shadow-map geometry
-            # (shadow.glsl's own self-cancelling
-            # `shadowProjection*shadowModelView*shadowModelViewInverse*
-            # shadowProjectionInverse*ftransform()` chain) is provably
-            # unaffected by this reconciliation even if it were wrong; only
-            # the shadow pass's own world-space math (waving, water
-            # caustics) depends on getting the offset right.
-            rot_shadow = self._rotation_only(shadow_cam_np.get_mat(render))
-            offset = cs_zup_to_yup.xform_vec(shadow_cam_np.get_pos(render) - cam_pos)
-            s_mv_inv = cs_yup_to_zup * rot_shadow * cs_zup_to_yup * LMatrix4.translate_mat(offset)
-            s_mv = LMatrix4(s_mv_inv)
-            s_mv.invert_in_place()
-        else:
-            s_mv, s_mv_inv, s_proj, s_proj_inv = gbuffer_mv, gbuffer_mv_inv, proj, proj_inv
-
-        # gbufferPreviousModelView/Projection and previousCameraPosition must
-        # be genuinely LAST frame's values, not a copy of this frame's — TAA
-        # (taa.glsl's Reprojection) unprojects the current pixel with the
-        # *current* inverse matrices, offsets by `cameraPosition -
-        # previousCameraPosition`, then reprojects with the *previous*
-        # forward matrices to find where that same world point was on
-        # screen last frame. Feeding identical current/previous matrices
-        # (as this did before) makes `cameraOffset` permanently zero and
-        # the reprojection a no-op — every reprojected sample lands back at
-        # the *current* screen position regardless of real camera motion,
-        # so TAA blends the new frame with a history texel that (whenever
-        # the camera actually moved) represents a different world point.
-        # That mismatch is exactly what reads as persistent speckle/noise
-        # ("staticy") under camera motion, on top of AO leaning on the same
-        # history buffer. Cached on `self` and updated at the end of every
-        # call, one frame behind on purpose.
-        prev_gbuffer_mv = getattr(self, "_prev_gbuffer_mv", gbuffer_mv)
-        prev_proj = getattr(self, "_prev_proj", proj)
-        prev_camera_position_mc = getattr(self, "_prev_camera_position_mc", camera_position_mc)
-        self._prev_gbuffer_mv = gbuffer_mv
-        self._prev_proj = proj
-        self._prev_camera_position_mc = camera_position_mc
-
-        return {
+        shared = {
             "frameTimeCounter": t, "frameTime": clock.get_dt(),
             "frameCounter": frame_count,
-            "viewWidth": w, "viewHeight": h, "aspectRatio": w / max(h, 1.0),
-            "near": lens.get_near(), "far": lens.get_far(),
             **day, "rainStrength": 0.0, "wetness": 0.0,
             # 0 in air, 1 submerged in water, 2 in lava. Every submerged effect a pack
             # has is gated on this -- the water fog, the underwater distortion, the
@@ -1767,13 +1835,81 @@ void main() {
             # can ever run. See `set_eye_in_water`.
             "isEyeInWater": int(self.eye_in_water),
             **self._eye_brightness_uniforms(clock.get_dt()),
-            "cameraPosition": camera_position_mc, "previousCameraPosition": prev_camera_position_mc,
+            "mcSunDirection": sun_mc * 100.0,
+        }
+        if shadow is not None:
+            shared.update({"shadowProjection": shadow[0], "shadowProjectionInverse": shadow[1],
+                           "mcShadowView": shadow[4], "mcShadowViewInverse": shadow[5]})
+        per_view = [self._view_uniforms(view, sun_mc, shadow) for view in self.views]
+        if shadow is None:
+            shared.update({"shadowProjection": per_view[0]["gbufferProjection"],
+                           "shadowProjectionInverse": per_view[0]["gbufferProjectionInverse"],
+                           "mcShadowView": per_view[0]["gbufferModelView"],
+                           "mcShadowViewInverse": per_view[0]["gbufferModelViewInverse"]})
+        return shared, per_view
+
+    def _view_uniforms(self, view: PipelineView, sun_mc: Any, shadow: Any) -> dict[str, Any]:
+        """The camera-describing uniforms for one view."""
+        from panda3d.core import LMatrix4, LVecBase3
+
+        render = self.base.render
+        cam_np, lens = view.camera, view.lens
+        w, h = (float(v) for v in self._view_size(view))
+        cam_pos = cam_np.get_pos(render)
+        cs_zup_to_yup, cs_yup_to_zup = self._cs_conversion()
+
+        # gbufferModelView/Inverse: OpenGL-standard view space (X-right, Y-up,
+        # Z-backward -- what every BSL shader assumes) <-> Minecraft-Y-up world,
+        # relative to the camera. Three rotations, not two: `cs_yup_to_zup`
+        # relabels GL view space into Panda's camera-local axes, `rot_view`
+        # carries that into Panda world, `cs_zup_to_yup` relabels into
+        # Minecraft's Y-up world. Built as a true inverse pair so every
+        # self-cancelling `gbufferModelView * gbufferModelViewInverse` chain
+        # reduces to Panda's own transform.
+        rot_view = self._rotation_only(cam_np.get_mat(render))
+        gbuffer_mv_inv = cs_yup_to_zup * rot_view * cs_zup_to_yup
+        gbuffer_mv = LMatrix4(gbuffer_mv_inv)
+        gbuffer_mv.invert_in_place()
+
+        # gbufferProjection must be in the *standard* OpenGL projection
+        # convention: packs read specific cells of it (`projMAD`/`diagonal3`
+        # in spaceConversion.glsl, `GetLinearDepth`) assuming the standard
+        # sparse layout, which Panda's native (Y-forward) matrix doesn't have.
+        proj = cs_yup_to_zup * LMatrix4(lens.get_projection_mat())
+        proj_inv = LMatrix4(proj)
+        proj_inv.invert_in_place()
+        camera_position_mc = cs_zup_to_yup.xform_point(cam_pos)
+
+        sun_view = gbuffer_mv.xform_vec(sun_mc) * 100.0
+        up_view = gbuffer_mv.xform_vec(LVecBase3(0, 1, 0)) * 100.0
+
+        if shadow is not None:
+            s_proj, s_proj_inv, rot_shadow, shadow_pos = shadow[:4]
+            # `position`/`worldPos` in every pack program is relative to the
+            # viewer's cameraPosition, so the shadow view carries the
+            # (shadow camera -> this camera) offset as a translation.
+            offset = cs_zup_to_yup.xform_vec(shadow_pos - cam_pos)
+            s_mv_inv = rot_shadow * LMatrix4.translate_mat(offset)
+            s_mv = LMatrix4(s_mv_inv)
+            s_mv.invert_in_place()
+        else:
+            s_mv, s_mv_inv = gbuffer_mv, gbuffer_mv_inv
+
+        # gbufferPrevious*/previousCameraPosition are genuinely LAST frame's
+        # values for this view: TAA reprojects with them, and feeding the
+        # current ones makes the reprojection a no-op (speckle under motion).
+        prev = getattr(view, "prev", None) or (gbuffer_mv, proj, camera_position_mc)
+        view.prev = (gbuffer_mv, proj, camera_position_mc)
+
+        return {
+            "viewWidth": w, "viewHeight": h, "aspectRatio": w / max(h, 1.0),
+            "near": lens.get_near(), "far": lens.get_far(),
+            "cameraPosition": camera_position_mc, "previousCameraPosition": prev[2],
             "gbufferModelView": gbuffer_mv, "gbufferModelViewInverse": gbuffer_mv_inv,
-            "gbufferPreviousModelView": prev_gbuffer_mv,
+            "gbufferPreviousModelView": prev[0],
             "gbufferProjection": proj, "gbufferProjectionInverse": proj_inv,
-            "gbufferPreviousProjection": prev_proj,
+            "gbufferPreviousProjection": prev[1],
             "shadowModelView": s_mv, "shadowModelViewInverse": s_mv_inv,
-            "shadowProjection": s_proj, "shadowProjectionInverse": s_proj_inv,
             "sunPosition": sun_view, "moonPosition": sun_view * -1.0,
             "shadowLightPosition": sun_view, "upPosition": up_view,
         }
@@ -1830,49 +1966,53 @@ void main() {
     def _update(self, task: Any) -> Any:
         from direct.task import Task
 
-        dynamic = self._dynamic_uniforms()
+        shared, per_view = self._dynamic_uniforms()
         sky_np = getattr(self, "_sky_np", None)
-        if sky_np is not None:
-            # A skybox must stay centred on the viewer, not the world origin,
-            # or the camera would eventually pass through its wall.
-            #
-            # This must be the camera's position in *Panda's* native Z-up
-            # scene graph. `dynamic["cameraPosition"]` is the same point
-            # already converted into Minecraft's Y-up convention for the
-            # shaders (see `_dynamic_uniforms`) — feeding that back into
-            # `set_pos` swaps the dome's vertical offset onto a horizontal
-            # axis, so the dome drifts sideways (and sinks) as the camera
-            # climbs, eventually clipping through it.
-            sky_np.set_pos(self.base.render, self.base.cam.get_pos(self.base.render))
+        ref_cam = self.reference_view.camera
+        if sky_np is not None and ref_cam is not None:
+            # A skybox must stay centred on the viewer, in Panda's native Z-up
+            # scene graph (not the Y-up cameraPosition handed to the shaders).
+            sky_np.set_pos(self.base.render, ref_cam.get_pos(self.base.render))
         # Only what actually changed. `set_shader_input` is not a cheap store: each
-        # call replaces the node's ShaderAttrib, and because most of these go on
-        # `render` -- the root of the scene graph -- every one of them invalidates the
-        # composed state of everything below it, so the cull thread re-derives the
-        # whole graph next frame and Panda's state cache fills with garbage to sweep.
-        #
-        # Most of these uniforms never change. Of BSL's 71, the handful that move per
-        # frame are the camera matrices, the clock and the frame counters; the rest are
-        # resolution, toggles, or a default for something this engine does not have.
-        # Pushing all 71 to all 11 targets every frame measured 781 calls and 10-13ms
-        # of the frame, and made `garbageCollectStates` cost another 6-7ms sweeping
-        # what they created. Skipping the unchanged ones takes both to near zero and
-        # leaves the live count of RenderStates flat instead of climbing every frame.
-        targets = [self.base.render] + self._quads
+        # call replaces the node's ShaderAttrib, and on `render` that invalidates the
+        # composed state of everything below it. Skipping unchanged values keeps
+        # BSL's 71 uniforms from costing 10+ms a frame (see git history).
+        render = self.base.render
         cache = self._uniform_cache
-        for name, gtype in self._uniform_types.items():
-            value = dynamic.get(name)
+        views = self.views
+
+        def resolve(name: str, gtype: str, value: Any) -> Any:
             if value is None:
                 value = self._NAMED_DEFAULTS.get(name)
             if value is None:
                 value = self._default_for(gtype)
-            value = self._coerce(value, gtype)
+            return self._coerce(value, gtype)
+
+        for name, gtype in self._uniform_types.items():
+            if name in _VIEW_UNIFORMS:
+                values = [resolve(name, gtype, pv.get(name)) for pv in per_view]
+                # render keeps the reference view's copy, for the shadow program
+                # (geometry programs derive their own; see mcshader.glsl.views).
+                if cache.get(name) != values[0] or name not in cache:
+                    cache[name] = values[0]
+                    render.set_shader_input(name, values[0])
+                for view, value in zip(views, values):
+                    if name in view.uniform_cache and view.uniform_cache[name] == value:
+                        continue
+                    view.uniform_cache[name] = value
+                    for quad in view.quads:
+                        quad.set_shader_input(name, value)
+                continue
+            value = resolve(name, gtype, shared.get(name))
             if name in cache and cache[name] == value:
                 continue
             # Stored before the writes, not after, so a value that fails to apply is
             # not remembered as applied.
             cache[name] = value
-            for node in targets:
-                node.set_shader_input(name, value)
+            render.set_shader_input(name, value)
+            for view in views:
+                for quad in view.quads:
+                    quad.set_shader_input(name, value)
         return Task.cont
 
     # -- inspection (headless) ------------------------------------------
@@ -1905,4 +2045,4 @@ void main() {
         plain textured quad (and toggling that mode to view it would corrupt
         the live shadow pass, since it's the same GPU texture object).
         """
-        return {f"colortex{i}": tex for i, tex in sorted(self._colortex.items())}
+        return {f"colortex{i}": tex for i, tex in sorted(self.reference_view.colortex.items())}

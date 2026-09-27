@@ -7,8 +7,8 @@ import pytest
 from mcshader import load_pack, build_graph, ShaderOptions, RenderTypeResolver
 from mcshader.pipeline import translate_pass
 
-PACK = os.path.join(os.path.dirname(__file__), "..", "Shaders")
-pytestmark = pytest.mark.skipif(not os.path.isdir(PACK), reason="Shaders/ not present")
+PACK = os.path.join(os.path.dirname(__file__), "..", "Shaders", "BSL_v10.0.zip")
+pytestmark = pytest.mark.skipif(not os.path.isfile(PACK), reason="Shaders/BSL_v10.0.zip not present")
 
 
 def _opts(pack):

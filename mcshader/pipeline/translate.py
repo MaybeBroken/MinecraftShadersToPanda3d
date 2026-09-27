@@ -18,6 +18,7 @@ from dataclasses import dataclass, field
 from ..config.options import ShaderOptions
 from ..glsl import preprocess
 from ..glsl.dialect import translate_stage
+from ..glsl.views import apply_camera_macros
 from ..pack.loader import ShaderPack
 from .graph import active_outputs
 
@@ -44,6 +45,7 @@ def translate_pass(
     mode: str = "colortex",
     gbuffer_map: dict[int, int] | None = None,
     max_location: int | None = None,
+    camera_macros: bool = False,
 ) -> TranslatedPass:
     """Produce translated vertex/fragment sources for one program.
 
@@ -58,6 +60,11 @@ def translate_pass(
       with only 8 color attachments).
     * ``"compact"``: location = ``k`` — for a single fullscreen pass whose small
       FBO binds attachment ``k`` to ``colortex[outputs[k]]``.
+
+    ``camera_macros`` rewrites camera-dependent uniforms (``gbufferModelView``,
+    ``cameraPosition``...) into expressions over Panda's per-camera built-ins,
+    so one compiled geometry program renders correctly from any number of
+    cameras (see :mod:`mcshader.glsl.views`).
     """
     files = options.rewrite_files(pack.files)
     program = pack.read_program(name, world=world)
@@ -84,7 +91,7 @@ def translate_pass(
 
     if vert_raw is not None:
         tr = translate_stage(prep(vert_raw, "vertex"), "vertex", target)
-        result.vertex = tr.source
+        result.vertex = apply_camera_macros(tr.source) if camera_macros else tr.source
         used.update(tr.mc_uniforms)
 
     if frag_raw is not None:
@@ -95,7 +102,7 @@ def translate_pass(
             frag_src, "fragment", target,
             frag_output_map=_output_map(frag_src, outputs, mode, gbuffer_map, max_location),
         )
-        result.fragment = tr.source
+        result.fragment = apply_camera_macros(tr.source) if camera_macros else tr.source
         used.update(tr.mc_uniforms)
 
     result.mc_uniforms = sorted(used)

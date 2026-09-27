@@ -118,7 +118,8 @@ class ShaderApp:
     def __init__(self, pack: str | None = None, *, base: Any = None,
                  profile: str | None = "LOW", world: str = "world0",
                  sky: bool = True, fly: bool = True, speed: float = 40.0,
-                 title: str = "mcshader", size: tuple[int, int] | None = None):
+                 title: str = "mcshader", size: tuple[int, int] | None = None,
+                 vr: Any = None):
         self.pack_path = find_pack(pack)
         self.base = base if base is not None else _make_showbase(title, size)
         self._owns_base = base is None
@@ -133,7 +134,11 @@ class ShaderApp:
             self.base, self.pack_path, world=world, profile=profile)
         #: The procedural sky dome (gradient, sun, moon, stars), or ``None``.
         self.sky = self.pipe.build_sky() if sky else None
-        if fly:
+        #: The Panda3d-VR bridge when rendering to a headset (see `attach_vr`).
+        self.vr = None
+        if vr is not None:
+            self.attach_vr(vr)
+        elif fly:
             self.fly_camera(speed=speed)
 
     # -- scene ----------------------------------------------------------
@@ -319,6 +324,26 @@ class ShaderApp:
         if entry.normal is not None or entry.specular is not None:
             self.pipe.set_material_maps(entry.np, entry.normal, entry.specular)
 
+    # -- VR -------------------------------------------------------------
+    def attach_vr(self, vr: Any, *, hidden_area: bool = False,
+                  option_overrides: dict | None = None) -> Any:
+        """Render the pack in a Panda3d-VR headset (``VRManager``).
+
+        Each eye gets its own gbuffer/composite chain; programs, shadows and
+        sky are shared. Without a headset connected the window view keeps
+        rendering (Panda3d-VR's simulator drives the camera). Returns the
+        :class:`mcshader.vr.VRBridge`.
+
+        Screen-only camera effects (depth of field, lens flare, vignette...)
+        are switched off while in the headset; see
+        :data:`mcshader.vr.VR_OPTION_OVERRIDES` / ``option_overrides``.
+        """
+        from .vr import VRBridge
+
+        self.vr = VRBridge(self.pipe, vr, hidden_area=hidden_area,
+                           option_overrides=option_overrides)
+        return self.vr
+
     # -- camera ---------------------------------------------------------
     def camera(self, *, pos: Sequence[float] | None = None,
                look_at: Sequence[float] | None = None,
@@ -329,6 +354,12 @@ class ShaderApp:
         Moves ``base.cam``, not ``base.camera`` — that's the node the
         pipeline derives its view matrices from.
         """
+        if self.vr is not None:
+            # The headset owns the eye lenses and poses: only the clip planes
+            # carry over (move the VR rig to place the player).
+            if near is not None or far is not None:
+                self.vr.set_clip_planes(near, far)
+            return self.base.cam
         cam = self.base.cam
         if pos is not None:
             cam.set_pos(*pos)
@@ -403,6 +434,8 @@ class ShaderApp:
 
     def reload(self) -> None:
         """Recompile with the current option values (keeps every tag)."""
+        if self.vr is not None:
+            self.vr.reapply_overrides()  # screen-only effects stay off in a headset
         self.pipe.recompile()
         self._after_rebuild()
 
@@ -693,7 +726,8 @@ def init(base: Any = None, pack: str | None = None, **kwargs: Any) -> ShaderApp:
     ``base`` is a ``ShowBase``; ``pack`` a pack directory or ``.zip`` (see
     :func:`find_pack` for where it looks by default). Other keywords go to
     :class:`ShaderApp`: ``profile``, ``world``, ``sky``, ``fly``, ``speed``,
-    ``title``, ``size``.
+    ``title``, ``size``, ``vr`` (a Panda3d-VR ``VRManager``; see
+    :meth:`ShaderApp.attach_vr`).
     """
     # Tolerate init("Shaders/") — the first argument reads as the pack when
     # it's a string, since an engine handle never is one.
