@@ -126,7 +126,7 @@ def install() -> None:
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(
-        description="Build the mcshader distribution.",
+        description="Build the distribution.",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
