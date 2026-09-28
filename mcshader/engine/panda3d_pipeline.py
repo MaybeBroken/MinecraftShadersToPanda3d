@@ -189,7 +189,12 @@ class PipelineRenderer:
     def __init__(self, base: Any, pack_path: str, *, world: str = "world0",
                  profile: str | None = None, target: str = "panda3d",
                  progress: ProgressCallback | None = None, prefs: Any = None,
-                 option_overrides: dict | None = None):
+                 option_overrides: dict | None = None,
+                 patches: Any = None):
+        #: Source edits applied to every pack this renderer loads; see `load_pack`.
+        self.patches = list(patches or ())
+        #: Extra uniforms fed to every program each frame; see `set_uniform`.
+        self.custom_uniforms: dict[str, Any] = {}
         # Panda3D pads every render-to-texture target up to the next power of
         # two by default (e.g. a 960x540 window -> a 1024x1024 texture, with
         # only the [0,0]-[960,540] corner actually rendered into). Our
@@ -212,6 +217,8 @@ class PipelineRenderer:
         self._geometry: list[tuple[Any, str]] = []  # (nodepath, render_type)
         #: 0 in air, 1 under water, 2 in lava; see `set_eye_in_water`.
         self.eye_in_water = 0
+        #: The carried light's level, 0..15; see `set_held_light`.
+        self.held_light = 0
         self._task_started = False
         self._enabled = True  # see set_enabled() -- pack-shaded vs. plain rendering
         self.profile_name: str | None = None
@@ -252,6 +259,7 @@ class PipelineRenderer:
         self._progress_done = self._progress_total = 0
         self._report("pack", "Reading shaderpack")
         self.pack = ShaderPack.from_path(pack_path)
+        self._apply_patches()
         self._shader_cache.clear()  # keyed without the pack
         self.world = world or self.world
         # Bootstrap parse: no option values exist yet, so any `#if` block in
@@ -272,7 +280,7 @@ class PipelineRenderer:
 
             self.overridden_options = override_options(self.options, option_overrides)
             if self.overridden_options:
-                print("[mcshader] VR: switched off screen-only effects: "
+                print("[mcshader] overriding pack options: "
                       + ", ".join(sorted(self.overridden_options)))
         # Re-parse now that real option values exist, so `#if` blocks around
         # `program.*.enabled` (confirmed real: Complementary Unbound gates
@@ -403,6 +411,7 @@ class PipelineRenderer:
         # geometry has no such vertex column, so it's a per-object uniform;
         # default to "outdoors under open sky" — see `set_lightmap`.
         nodepath.set_shader_input("mcLightmap", self._NAMED_DEFAULTS["mcLightmap"])
+        nodepath.set_shader_input("mcUseVertexLight", 0.0)
         # Marks this subtree as shadow-casting geometry: the shadow camera's
         # tag state swaps in shadow.glsl for it (see `_build_shadow_pass`).
         # Set unconditionally — independent of `_enabled`, which only toggles
@@ -473,6 +482,39 @@ class PipelineRenderer:
         this is an approximation until per-vertex attributes are wired).
         """
         nodepath.set_shader_input("mcEntityId", int(block_id))
+
+    def _apply_patches(self) -> None:
+        """Apply `patches` -- (file, old, new) exact-text edits -- to the pack's
+        sources before they're translated. A patch whose text isn't found is
+        reported and skipped, so a pack update can't silently half-apply one."""
+        for relpath, old, new in self.patches:
+            text = self.pack.files.get(relpath)
+            if text is None or old not in text:
+                print(f"mcshader: patch for {relpath!r} did not match; skipped")
+                continue
+            self.pack.files[relpath] = text.replace(old, new)
+
+    def set_uniform(self, name: str, value: Any) -> None:
+        """Feed a uniform of the caller's own (say, one a patch declares) to
+        every program, every frame, until changed."""
+        self.custom_uniforms[name] = value
+
+    def set_vertex_lightmap(self, nodepath: Any, enabled: bool = True) -> None:
+        """Light ``nodepath`` from its own per-vertex lightmap instead of the
+        per-object one: its geometry must carry an ``mcVertexLight`` vec2 column
+        of (block light, sky light), each 0..1 -- what Minecraft feeds as
+        ``gl_MultiTexCoord1``. Lamps can then light the surfaces near them and
+        leave the rest dark, which one value per object never can."""
+        nodepath.set_shader_input("mcUseVertexLight", 1.0 if enabled else 0.0)
+
+    def set_held_light(self, level: float) -> None:
+        """Brightness of the light the player carries, as Minecraft's
+        ``heldBlockLightValue`` (0 = none, 15 = a torch). Packs with dynamic
+        handheld light (BSL's DYNAMIC_HANDLIGHT) light the scene around the
+        camera by it; the reach is roughly ``level / 2`` metres. Values past 15
+        (up to 30) are accepted: BSL's falloff is plain arithmetic on the value,
+        so they give a stronger, longer light than any Minecraft item."""
+        self.held_light = max(0, min(30, int(round(level))))
 
     def set_lightmap(self, nodepath: Any, block_light: float, sky_light: float) -> None:
         """Set the Minecraft lightmap a gbuffers shader lights ``nodepath`` by.
@@ -1885,6 +1927,15 @@ void main() {
     #: changes instead of sitting at whatever a single fixed constant gave it.
     _DAY_LENGTH_SECONDS = 60*12 #12 minutes irl time
 
+    #: A fixed ``worldTime`` (0..24000, Minecraft ticks) that overrides the
+    #: clock-driven day cycle, or None to let the clock run. See `set_world_time`.
+    world_time: float | None = None
+
+    def set_world_time(self, ticks: float | None) -> None:
+        """Pin the time of day to ``ticks`` (Minecraft's 0..24000), or None to
+        hand it back to the clock. 6000 is noon, 18000 midnight, 23000 dawn."""
+        self.world_time = None if ticks is None else float(ticks) % 24000.0
+
     def _day_cycle_uniforms(self, t: float, frame_count: int) -> dict[str, Any]:
         """The handful of ``shaders.properties`` custom uniforms BSL actually
         needs (see shaders.properties' "Custom Time/Blindness/Frame Jitter
@@ -1902,7 +1953,10 @@ void main() {
         """
         import math
 
-        world_time = (t / self._DAY_LENGTH_SECONDS * 24000.0) % 24000.0
+        if self.world_time is not None:
+            world_time = self.world_time
+        else:
+            world_time = (t / self._DAY_LENGTH_SECONDS * 24000.0) % 24000.0
         time_angle = world_time / 24000.0
 
         def clamp01(x: float) -> float:
@@ -1973,6 +2027,8 @@ void main() {
             # a positive claim that the camera is never in water, so none of that code
             # can ever run. See `set_eye_in_water`.
             "isEyeInWater": int(self.eye_in_water),
+            "heldBlockLightValue": int(self.held_light), "heldBlockLightValue2": 0,
+            **self.custom_uniforms,
             **self._eye_brightness_uniforms(clock.get_dt()),
             "mcSunDirection": sun_mc * 100.0,
         }

@@ -94,7 +94,7 @@ class _Tagged:
     scene's materials.
     """
 
-    __slots__ = ("np", "type", "block", "light", "normal", "specular")
+    __slots__ = ("np", "type", "block", "light", "normal", "specular", "vertex_light")
 
     def __init__(self, np: Any, render_type: str | None,
                  block: int | str | None, light: tuple[float, float] | None,
@@ -105,6 +105,7 @@ class _Tagged:
         self.light = light
         self.normal = normal
         self.specular = specular
+        self.vertex_light = False
 
 
 class ShaderApp:
@@ -119,7 +120,8 @@ class ShaderApp:
                  profile: str | None = "LOW", world: str = "world0",
                  sky: bool = True, fly: bool = True, speed: float = 40.0,
                  title: str = "mcshader", size: tuple[int, int] | None = None,
-                 vr: Any = None, progress: Any = None, prefs: Any = None):
+                 vr: Any = None, progress: Any = None, prefs: Any = None,
+                 patches: Any = None, options: dict | None = None):
         self.pack_path = find_pack(pack)
         self.base = base if base is not None else _make_showbase(title, size)
         self._owns_base = base is None
@@ -135,10 +137,14 @@ class ShaderApp:
             # Switch the screen-only effects off before the first build, so
             # the headset connecting only has to rebuild render targets.
             from .vr import VR_OPTION_OVERRIDES
-            overrides = VR_OPTION_OVERRIDES
+            overrides = dict(VR_OPTION_OVERRIDES)
+        if options:
+            # Pack options the application insists on, whatever the saved prefs say.
+            overrides = {**(overrides or {}), **options}
         self.pipe = PipelineRenderer(
             self.base, self.pack_path, world=world, profile=profile,
-            progress=progress, prefs=prefs, option_overrides=overrides)
+            progress=progress, prefs=prefs, option_overrides=overrides,
+            patches=patches)
         #: The procedural sky dome (gradient, sun, moon, stars), or ``None``.
         self.sky = self.pipe.build_sky() if sky else None
         #: The Panda3d-VR bridge when rendering to a headset (see `attach_vr`).
@@ -216,8 +222,13 @@ class ShaderApp:
     def attach(self, nodepath: Any, *, type: str | None = None,
                block: int | str | None = None,
                light: tuple[float, float] | None = None,
-               normal: Any = None, specular: Any = None) -> Any:
+               normal: Any = None, specular: Any = None,
+               vertex_light: bool | None = None) -> Any:
         """Shade a node you made yourself (or retag one you already gave us).
+
+        ``vertex_light=True`` lights it from the ``mcVertexLight`` column its
+        geometry carries instead of the per-object ``light``; see
+        :meth:`~mcshader.engine.panda3d_pipeline.PipelineRenderer.set_vertex_lightmap`.
 
         Re-applied for you after every recompile, profile switch and pack
         swap — including ``block``, ``light`` and the PBR maps, all of which
@@ -241,6 +252,8 @@ class ShaderApp:
             entry.normal = normal
         if specular is not None:
             entry.specular = specular
+        if vertex_light is not None:
+            entry.vertex_light = vertex_light
         self._apply(entry)
         return nodepath
 
@@ -259,6 +272,22 @@ class ShaderApp:
                           specular: Any = None) -> Any:
         """Give one node its own labPBR normal/specular maps."""
         return self.attach(nodepath, normal=normal, specular=specular)
+
+    def set_uniform(self, name: str, value: Any) -> None:
+        """Feed a uniform of your own to every program (e.g. one a ``patches``
+        edit declares). See :meth:`~mcshader.engine.panda3d_pipeline.PipelineRenderer.set_uniform`."""
+        self.pipe.set_uniform(name, value)
+
+    def set_held_light(self, level: float) -> None:
+        """How bright the light the player carries is, 0 (none) to 15 (a torch).
+        With the pack's dynamic handheld light on, it lights everything within
+        about ``level / 2`` metres of the camera."""
+        self.pipe.set_held_light(level)
+
+    def set_world_time(self, ticks: float | None) -> None:
+        """Pin the time of day, in Minecraft ticks (0..24000; 6000 noon, 18000
+        midnight, 23000 dawn), or pass None to let the built-in day cycle run."""
+        self.pipe.set_world_time(ticks)
 
     def set_eye_in_water(self, state: int) -> None:
         """Tell the pack the camera is under water (1), in lava (2) or in air (0).
@@ -330,6 +359,8 @@ class ShaderApp:
             self.pipe.set_lightmap(entry.np, *entry.light)
         if entry.normal is not None or entry.specular is not None:
             self.pipe.set_material_maps(entry.np, entry.normal, entry.specular)
+        if entry.vertex_light:
+            self.pipe.set_vertex_lightmap(entry.np, True)
 
     # -- VR -------------------------------------------------------------
     def attach_vr(self, vr: Any, *, hidden_area: bool = False,

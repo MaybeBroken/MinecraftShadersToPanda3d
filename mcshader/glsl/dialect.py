@@ -245,9 +245,17 @@ def translate_stage(
     # PipelineRenderer.set_lightmap), defaulting to (0, 1) — outdoors under
     # open sky, which is what an engine scene is until a caller says
     # otherwise — mirroring how `mc_Entity` is handled just below.
+    #
+    # Geometry that does carry a real per-vertex lightmap (an `mcVertexLight`
+    # vec2 column) opts in with `mcUseVertexLight = 1` (see
+    # PipelineRenderer.set_vertex_lightmap); everything else keeps the uniform.
     if re.search(r"\bgl_MultiTexCoord1\b", body):
-        body = re.sub(r"\bgl_MultiTexCoord1\b", "vec4(mcLightmap, 0.0, 1.0)", body)
+        body = re.sub(
+            r"\bgl_MultiTexCoord1\b",
+            "vec4(mix(mcLightmap, mcVertexLight, mcUseVertexLight), 0.0, 1.0)", body)
         introduced.append(("mcLightmap", "uniform vec2"))
+        introduced.append(("mcUseVertexLight", "uniform float"))
+        introduced.append(("mcVertexLight", "attrib vec2"))
 
     # 3b. Custom Minecraft per-vertex attributes (mc_Entity, mc_midTexCoord, …)
     # have no real per-vertex data in engine-authored geometry — nothing in this
